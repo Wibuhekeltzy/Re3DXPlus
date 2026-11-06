@@ -902,6 +902,9 @@ static int options_load(void) {
     G.menu.key_shift_dx = sh[2] < -2000 || sh[2] > 2000 ? 0 : sh[2];
     G.menu.key_shift_dy = sh[3] < -2000 || sh[3] > 2000 ? 0 : sh[3];
   }
+  /* the story's last time of day (menu.h story_zone), a fifth line: 0 morning, 1 night */
+  int sz = 0;
+  if (n >= 3 && fscanf(f, " story %d", &sz) == 1) G.menu.story_zone = sz == 1;
   fclose(f);
   if (n < 3) return 0;
   G.menu.hires = hires != 0;
@@ -918,8 +921,8 @@ static int options_load(void) {
 }
 
 static void options_save(void) {
-  static int last[29] = { -1 };
-  int now[29] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
+  static int last[30] = { -1 };
+  int now[30] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
                   G.menu.bm_on, G.menu.hd_tex, G.menu.bloom_on, G.menu.ssao_on, G.menu.wet_on, G.menu.paint_on,
                   G.menu.aa4, G.menu.hires };
   for (int g = 0; g < 3; ++g)
@@ -927,6 +930,7 @@ static void options_save(void) {
   now[23] = G.menu.story_test;
   now[24] = G.menu.ta_traffic;
   now[25] = G.menu.key_shift_sep, now[26] = G.menu.key_shift_k, now[27] = G.menu.key_shift_dx, now[28] = G.menu.key_shift_dy;
+  now[29] = G.menu.story_zone;
   if (G.options_global && !memcmp(now, last, sizeof now)) return;
   char path[1100];
   snprintf(path, sizeof path, "%s/option", G.save_dir);
@@ -939,6 +943,7 @@ static void options_save(void) {
   fprintf(f, "test %d\n", now[23]);
   fprintf(f, "traffic %d\n", now[24]);
   fprintf(f, "shift %d %d %d %d\n", now[25], now[26], now[27], now[28]);
+  fprintf(f, "story %d\n", now[29]);
   fclose(f);
   memcpy(last, now, sizeof last);
   G.options_global = 1;
@@ -1424,6 +1429,7 @@ int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, 
   garage_load();
   records_load();
   G.menu.zone = zone;
+  G.menu.ta_zone = zone; /* (the time attack's own time of day, apart from a story race's: menu.h) */
   G.menu.zones = zones;
   G.race_model = &G.fd3s;
   G.rival = G.rival_env = -1;
@@ -1900,6 +1906,13 @@ static const int ENDING_CHARA[2] = { 109, 108 };
 static int ending_row(void) {
   for (int i = 0; i < RIVALDB_N; ++i)
     if (RIVALDB[i].model == 247) return i;
+  return -1;
+}
+
+/* the RIVALDB row of a story select's race (its first rival), -1 if none */
+static int story_row(int pick, int race) {
+  for (int i = 0; i < RIVALDB_N; ++i)
+    if (RIVALDB[i].select == pick && RIVALDB[i].race == race && RIVALDB[i].slot == 0) return i;
   return -1;
 }
 
@@ -3395,14 +3408,24 @@ static void menu_frame(float dt, double frame_start) {
   } else if (G.menu.screen == MENU_BGM && G.menu.vs.day) { /* the area's city, once known */
     if (G.menu.vs.area_final >= 0 || G.menu.vs.me == G.menu.vs.host) city = car_course_city(G.menu.course);
   } else if (G.menu.game == MENU_GAME_STORY) {
-    int r = story_rival();
+    /* (the race's time of day card, before its title page, shows the same city's map: the
+     * select's first race, its rival not looked up for the race itself yet) */
+    int r = G.menu.day_pick ? story_row(G.menu.story_pick, 0) : story_rival();
     if (G.menu.screen == MENU_PRE && G.menu.ending == 2) city = STORYCITY[ENDING_SERIES];
-    else if (G.menu.screen == MENU_PRE && r >= 0 && RIVALDB[r].series >= 0 && RIVALDB[r].series < STORYCITY_N)
+    else if ((G.menu.screen == MENU_PRE || G.menu.day_pick) && r >= 0 && RIVALDB[r].series >= 0 && RIVALDB[r].series < STORYCITY_N)
       city = STORYCITY[RIVALDB[r].series];
   } else if (G.menu.game == MENU_GAME_TEN) {
-    if (G.menu.screen == MENU_PRE) city = TEN_CITY[menu_ten_course(&G.menu)];
+    if (G.menu.screen == MENU_PRE || G.menu.day_pick) city = TEN_CITY[menu_ten_course(&G.menu)];
   } else if (G.menu.screen == MENU_BGM || G.menu.screen == MENU_PRE) /* decided, not while browsing */
     city = car_course_city(G.menu.course);
+  if (G.menu.day_pick) {
+    /* a race's time of day card: the cards there are maps for in that city (a city without a
+     * night map has the morning one alone) */
+    char night_path[1200];
+    city_path(night_path, sizeof night_path, "", city, 1, "wpk");
+    G.menu.zones = access(night_path, R_OK) == 0 ? 2 : 1;
+    if (G.menu.zone >= G.menu.zones) G.menu.zone = 0;
+  }
   if ((G.menu.zone != G.track_zone || city != G.track_city || G.hd_reload) && !G.menu.slide && rest &&
       track_open(city, G.menu.zone) != 0) {
     fprintf(stderr, "no map of city %d zone %d, back to Tokyo's morning\n", city, G.menu.zone);

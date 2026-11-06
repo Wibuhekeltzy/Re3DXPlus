@@ -1120,8 +1120,9 @@ const char *menu_bgm(const menu_state *m, int racing) {
   if (m->screen == MENU_SETTING && m->tune_confirm)
     return m->tune_confirm == MENU_BGM ? NULL : m->music ? MUSIC_SELECT : MUSIC_ENTRY;
   if (m->screen < MENU_START) return NULL; /* the attract loop: its movies have their own sound */
-  /* mseqTimeAttack stops the music once the BGM is chosen (before seqTaCourseDecide) */
-  if ((m->screen == MENU_BGM && m->deciding) || m->screen == MENU_PRE) return NULL;
+  /* mseqTimeAttack stops the music once the BGM is chosen (before seqTaCourseDecide); a story
+   * race's time of day (day_pick) chooses no BGM: the select music goes on to the tune check */
+  if ((m->screen == MENU_BGM && m->deciding && !m->day_pick) || m->screen == MENU_PRE) return NULL;
   /* the result's music plays on through the screens after a race (mseqStory: no stream change
    * from result2's 0x6d till its sequence ends; the story's tuning, the dress-up parts won),
    * the select music back on the mode select; the car setting's on the dress-up menu it opens */
@@ -1179,8 +1180,8 @@ static int day_select_step(menu_state *m, int tap, int key) {
     m->slide = SLIDE;
     return 0;
   }
-  /* (a versus' BGM is the host's: the others have no line) */
-  int bgm = !m->vs.day || m->vs.me == m->vs.host;
+  /* (a versus' BGM is the host's: the others have no line; a story race's time of day has none) */
+  int bgm = !m->day_pick && (!m->vs.day || m->vs.me == m->vs.host);
   int d = m->zones > 1 || !bgm ? 0 : key;
   /* the BGM line itself (with the arrow keys either side of it) steps on, like the button */
   if (bgm && tap && m->tap_x >= 170.0f && m->tap_x < 560.0f && m->tap_y >= 326.0f && m->tap_y < 392.0f) d = 1;
@@ -1190,7 +1191,16 @@ static int day_select_step(menu_state *m, int tap, int key) {
     return 0;
   }
   if (tap && on_card(m, 0)) {
-    day_decide(m);
+    if (m->day_pick) {
+      /* a race's time of day: the card shown, the race's song as it was (the story's own) */
+      snd_menu(SND_SELECT);
+      if (m->day_pick == MENU_ST_RIVAL && m->story_zone != m->zone) {
+        m->story_zone = m->zone;
+        m->garage_changed = 1; /* (the app keeps it with the options) */
+      }
+    } else {
+      day_decide(m);
+    }
     return 1;
   }
   return 0;
@@ -1343,6 +1353,7 @@ static void draw_day_select(const menu_state *m, int clock, float fade, int bars
     draw_topbar(bars, fade, &title);
   }
   anm_draw(ID.bottom, bars, fade);
+  if (m->day_pick) return; /* a story race's time of day: the race has its own song */
   if (m->vs.day && m->vs.me != m->vs.host) return; /* a versus' song is the host's */
   int set = bgm_set(m);
   anm_swap name[2] = { { anm_sprite(T_BGM_FONT), anm_sprite(BGM_TEXT + 30 * set + m->sel) },
@@ -4917,6 +4928,24 @@ static void ten_level_enter(menu_state *m) {
   m->ten_face_lv = m->sel;
   m->ten_face_t = 0;
   m->card_t = 0;
+}
+
+/* A story race's (a 10-in-a-row level's) time of day: the time zone select's cards alone, after
+ * the rival (level) select. The first time in, zones and zone from before are kept (the back key
+ * puts them back; the app sets zones by the race's city while the cards are up), and the cards
+ * open on the story's last choice, on the level's own time for a 10-in-a-row; coming back to
+ * them from the tune check, on the one chosen. */
+static void day_pick_enter(menu_state *m, int from, int first) {
+  if (first) {
+    m->day_zone_was = m->zone;
+    m->zone = from == MENU_ST_RIVAL ? m->story_zone : ten_night(m->ten_course, m->ten_level);
+  }
+  m->day_zones_was = m->zones;
+  if (m->zone >= m->zones) m->zone = 0;
+  go(m, MENU_BGM);
+  m->day_pick = from;
+  m->slide = m->card_t = 0;
+  m->bars = 1;
 }
 
 static void ten_level_step(menu_state *m, int tap, int key) {
@@ -8638,8 +8667,9 @@ static void step(menu_state *m) {
     }
     return;
   }
-  /* the car setting goes back to the save's cars: the car is one of them by now */
-  if (back && m->screen == MENU_SETTING && m->from < 0 && !m->save_skip && !m->new_card && m->own_sel >= 0) {
+  /* the car setting goes back to the save's cars: the car is one of them by now (the pre-race
+   * tune check's back key goes to the screen it came from, below) */
+  if (back && m->screen == MENU_SETTING && !m->tune_confirm && m->from < 0 && !m->save_skip && !m->new_card && m->own_sel >= 0) {
     snd_menu(SND_CANCEL);
     garage_enter(m, m->own_sel);
     return;
@@ -8671,10 +8701,25 @@ static void step(menu_state *m) {
     int from = m->tune_confirm;
     m->tune_confirm = 0;
     snd_menu(SND_CANCEL);
-    if (from == MENU_ST_RIVAL) st_rival_enter(m);
-    else if (from == MENU_TEN_LEVEL) ten_level_enter(m);
+    if (from == MENU_ST_RIVAL || from == MENU_TEN_LEVEL) day_pick_enter(m, from, 0); /* (the time of day chosen) */
     else if (from == MENU_VS_SEL) go(m, MENU_VS_SEL), m->sel = m->vs.kind;
     else go(m, MENU_BGM), m->sel = m->bgm, m->slide = m->card_t = 0, m->bars = 1;
+    return;
+  }
+  if (back && m->screen == MENU_BGM && m->day_pick && m->from < 0 && !m->slide) {
+    /* a race's time of day: back to the rival (level) select, with the zone and zones it came with */
+    int from = m->day_pick;
+    snd_menu(SND_CANCEL);
+    m->day_pick = 0;
+    m->zones = m->day_zones_was;
+    m->zone = m->day_zone_was;
+    if (from == MENU_ST_RIVAL) {
+      st_rival_enter(m);
+      m->sel = m->story_n % 5; /* (the episode chosen) */
+    } else {
+      ten_level_enter(m);
+      m->sel = m->ten_face_lv = m->ten_level;
+    }
     return;
   }
   if (back && m->screen > MENU_MAKER && m->screen <= MENU_BGM && m->from < 0 && m->rot_speed == 0.0f && !m->slide && !m->vs.day) {
@@ -8961,6 +9006,7 @@ int menu_update(menu_state *m, float dt) {
       } else if (m->screen == MENU_COURSE) {
         m->course = m->sel;
         go(m, MENU_BGM);
+        m->zone = m->ta_zone < m->zones ? m->ta_zone : 0; /* (the time attack's own, not a story race's) */
         m->sel = m->bgm;
         m->slide = m->card_t = 0;
         m->bars = 1;
@@ -8968,11 +9014,10 @@ int menu_update(menu_state *m, float dt) {
         m->ten_course = m->sel;
         ten_level_enter(m);
       } else if (m->screen == MENU_TEN_LEVEL) {
-        /* the level's time zone (clEffTenCourseType::getDayTime, as the title page's) and a
-         * song at random */
+        /* the level's time zone (clEffTenCourseType::getDayTime, as the title page's, on the
+         * cards that ask first) and a song at random */
         m->ten_level = m->sel;
-        m->zone = ten_night(m->ten_course, m->ten_level);
-        tune_confirm_enter(m, MENU_TEN_LEVEL);
+        day_pick_enter(m, MENU_TEN_LEVEL, 1);
         m->song = 1 + rand() % (bgm_lines(m) - 2);
       } else if (m->screen == MENU_ST_LEVEL) {
         m->st_level = m->sel;
@@ -8983,7 +9028,7 @@ int menu_update(menu_state *m, float dt) {
         m->story_n = 20 * st_division(m) + 5 * m->st_level + m->sel;
         m->story_pick = st_index(st_loop(m), m->story_n);
         if (m->story_pick > 111) m->story_pick = 111;
-        tune_confirm_enter(m, MENU_ST_RIVAL);
+        day_pick_enter(m, MENU_ST_RIVAL, 1); /* (the race's time of day first, then the tune check) */
         m->song = 1 + rand() % (bgm_lines(m) - 2);
         menu_story_song(m, 0);
       } else if (m->screen == MENU_ST_TUNE) {
@@ -9039,7 +9084,15 @@ int menu_update(menu_state *m, float dt) {
       } else if (m->screen == MENU_TG_MAKER) {
         m->tg.maker = WM_MAKER[m->sel];
         tg_wheel_open_at(m, m->tg.maker);
+      } else if (m->screen == MENU_BGM && m->day_pick) {
+        /* a race's time of day chosen: the pre-race tune check, as it was straight from the
+         * rival (level) select */
+        int from = m->day_pick;
+        m->day_pick = 0;
+        m->zones = m->day_zones_was;
+        tune_confirm_enter(m, from);
       } else if (m->screen == MENU_BGM) {
+        if (!m->vs.day && m->game == MENU_GAME_TA) m->ta_zone = m->zone;
         tune_confirm_enter(m, MENU_BGM);
       } else if (m->screen == MENU_PRE) {
         return 1;

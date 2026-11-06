@@ -177,6 +177,15 @@ typedef struct {
    * loads (a story episode chosen, the time attack's or 10-in-a-row's time zone, the versus
    * kind before its lobby), DONE on to it; tune_confirm the screen it came from (0 none) */
   int tune_confirm;
+  /* The time of day of a story race and of a 10-in-a-row level, asked before the race as the
+   * Android 1.31 port asks the story's: the time zone select's cards alone (MENU_BGM; the race
+   * keeps its own song) between the rival (level) select and the tune check. day_pick is the
+   * screen it came from, MENU_ST_RIVAL or MENU_TEN_LEVEL (0: none, the time attack's or the
+   * versus' select), where its back key goes; day_zones_was and day_zone_was the zones and zone
+   * from before it (the app sets zones by the race's city while it is up). story_zone is the
+   * story's last choice and ta_zone the time attack's, kept apart (a 10-in-a-row level starts
+   * on its own time, the arcade's). */
+  int day_pick, day_zones_was, day_zone_was, story_zone, ta_zone;
   /* the time attack's traffic (Allan 10-31): the course select's TRAFFIC key, off as the
    * arcade's (its hidden button set SConfigPlay +0xac); kept with the options */
   int ta_traffic;
