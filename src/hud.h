@@ -141,9 +141,16 @@ enum { HUD_KEYS_TOP, HUD_KEYS_LEFT, HUD_KEYS_RIGHT, HUD_KEY_GROUPS };
 #define HUD_KEY_K_MIN 0.6f
 #define HUD_KEY_K_MAX 1.6f
 void hud_layout_set(int group, float k, float dx, float dy);
-/* the group whose keys are at (x, y) (with the gyro's keys or the steer buttons'), -1 none */
+/* The shift keys can leave the right group (the KEY LAYOUT's fourth group, HUD_EDIT_SHIFT):
+ * separate, they take their own size k and move (dx, dy), anchored at the right side like the
+ * right keys' own; not separate, they follow the right group as before. */
+enum { HUD_EDIT_SHIFT = HUD_KEY_GROUPS, HUD_EDIT_GROUPS };
+void hud_shift_layout_set(int separate, float k, float dx, float dy);
+/* the group whose keys are at (x, y) (with the gyro's keys or the steer buttons'), -1 none;
+ * the shift keys are HUD_EDIT_SHIFT, whether separate or not */
 int hud_layout_hit(int gyro, float x, float y);
-/* (dx, dy) brought back so the group, k times its size, stays on the screen */
+/* (dx, dy) brought back so the group, k times its size, stays on the screen (a HUD_EDIT_SHIFT
+ * group with its own k, dx, dy) */
 void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy);
 /* the editor's view: the race's keys as hud_layout_set has them, group sel (-1 none) outlined */
 void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel);

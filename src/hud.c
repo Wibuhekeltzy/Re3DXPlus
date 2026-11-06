@@ -61,6 +61,10 @@ static float EDGE, KEY_K = 1;
 enum { KEY_TOP, KEY_LEFT, KEY_RIGHT }; /* (hud.h's HUD_KEYS_*) */
 /* the player's own layout (hud_layout_set): each side's keys scaled about their corner, moved */
 static float USER_K[3] = { 1, 1, 1 }, USER_DX[3], USER_DY[3];
+/* the shift keys' own layout (hud_shift_layout_set): while separate they have their own size and
+ * move, anchored at the right side like the right keys; else they follow the right keys */
+static int shift_separate;
+static float shift_k = 1, shift_dx, shift_dy;
 
 /* a rect of a side's keys on screen, the side k times its size and moved (dx, dy) */
 static rect place(rect r, int side, float k, float dx, float dy) {
@@ -72,6 +76,17 @@ static rect place(rect r, int side, float k, float dx, float dy) {
 
 /* a touch key's layout rect where it is on screen */
 static rect key(rect r, int side) { return place(r, side, USER_K[side], USER_DX[side], USER_DY[side]); }
+
+void hud_shift_layout_set(int separate, float k, float dx, float dy) {
+  shift_separate = !!separate;
+  shift_k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
+  shift_dx = dx, shift_dy = dy;
+}
+
+/* a shift key's layout rect where it is on screen: with the right keys, or its own once separate */
+static rect shift_key(rect r) {
+  return shift_separate ? place(r, KEY_RIGHT, shift_k, shift_dx, shift_dy) : key(r, KEY_RIGHT);
+}
 
 /* a screen point in a side's own layout px (key()'s inverse) */
 static void unkey(int side, float x, float y, float *lx, float *ly) {
@@ -164,7 +179,7 @@ static int steer_touch(hud_state *h, void *id, int phase, float x, float y) {
 
 void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
   rect brake = h->gyro ? key(G_BRAKE, KEY_LEFT) : key(BRAKE, KEY_RIGHT);
-  rect up = key(h->gyro ? G_SHIFT_UP : SHIFT_UP, KEY_RIGHT), down = key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN, KEY_RIGHT);
+  rect up = shift_key(h->gyro ? G_SHIFT_UP : SHIFT_UP), down = shift_key(h->gyro ? G_SHIFT_DOWN : SHIFT_DOWN);
   rect throttle = key(THROTTLE, KEY_RIGHT), left = key(LEFT, KEY_LEFT), right = key(RIGHT, KEY_LEFT);
   if (phase == TOUCH_BEGAN && keys_pause_only()) {
     if (inside(key(PAUSE, KEY_TOP), x, y)) h->pause_pressed++;
@@ -2241,6 +2256,15 @@ static void draw_keys(const hud_state *h, float steer, int all_keys) {
       if (!h->gyro) pedal_bar(brake, h->brake_touch ? h->brake_v : 0);
     }
 
+    /* the shift keys' own size and place, once they have left the right keys (the same anchor) */
+    if (shift_separate) {
+      rect origin = shift_key((rect){ 0, 0, 1, 1 });
+      mat4 m = mat4_identity();
+      m.m[0] = m.m[5] = origin.w;
+      m.m[12] = origin.x, m.m[13] = origin.y;
+      side_proj = mat4_mul(screen_ortho(h->screen_w, h->screen_h), m);
+      glUniformMatrix4fv(u_proj, 1, GL_FALSE, side_proj.m);
+    }
     /* shift up / down */
     button(up, 0);
     button(down, 0);
@@ -2638,10 +2662,17 @@ void hud_lift(float dy, float left) {
 static rect group_rect(int group, int gyro) {
   if (group == KEY_LEFT) return (rect){ LEFT.x, LEFT.y - 14, RIGHT.x + RIGHT.w - LEFT.x, LEFT.h + 14 };
   if (group == KEY_RIGHT) {
-    float x = gyro ? G_SHIFT_UP.x : SHIFT_UP.x;
+    /* the shift keys count in it only while they follow it (hud_shift_layout_set) */
+    float x = shift_separate ? (gyro ? THROTTLE.x : BRAKE.x) : (gyro ? G_SHIFT_UP.x : SHIFT_UP.x);
     return (rect){ x, THROTTLE.y, THROTTLE.x + THROTTLE.w - x, BRAKE.y + BRAKE.h - THROTTLE.y };
   }
   return (rect){ CAMERA.x, CAMERA.y, RESET.x + RESET.w - CAMERA.x, CAMERA.h };
+}
+
+/* the shift keys' box, the pair, in the layout before shift_key() */
+static rect shift_rect(int gyro) {
+  rect up = gyro ? G_SHIFT_UP : SHIFT_UP, down = gyro ? G_SHIFT_DOWN : SHIFT_DOWN;
+  return (rect){ up.x, up.y, up.w, down.y + down.h - up.y };
 }
 
 void hud_layout_set(int group, float k, float dx, float dy) {
@@ -2651,6 +2682,9 @@ void hud_layout_set(int group, float k, float dx, float dy) {
 }
 
 int hud_layout_hit(int gyro, float x, float y) {
+  /* the shift keys first: they are the right group's own part until they leave it */
+  rect s = shift_key(shift_rect(gyro));
+  if (x >= s.x - 10 && x <= s.x + s.w + 10 && y >= s.y - 10 && y <= s.y + s.h + 10) return HUD_EDIT_SHIFT;
   for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
     rect r = key(group_rect(g, gyro), g);
     if (x >= r.x - 10 && x <= r.x + r.w + 10 && y >= r.y - 10 && y <= r.y + r.h + 10) return g;
@@ -2659,9 +2693,9 @@ int hud_layout_hit(int gyro, float x, float y) {
 }
 
 void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
-  if (group < 0 || group >= HUD_KEY_GROUPS) return;
+  if (group < 0 || group >= HUD_EDIT_GROUPS) return;
   k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
-  rect r = place(group_rect(group, gyro), group, k, *dx, *dy);
+  rect r = group == HUD_EDIT_SHIFT ? place(shift_rect(gyro), KEY_RIGHT, k, *dx, *dy) : place(group_rect(group, gyro), group, k, *dx, *dy);
   if (r.x + r.w > 1024 + EDGE) *dx -= r.x + r.w - (1024 + EDGE);
   if (r.x < -EDGE) *dx += -EDGE - r.x;
   if (r.y + r.h > 768) *dy -= r.y + r.h - 768;
@@ -2688,8 +2722,8 @@ void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
   draw_keys(&h, 0, 1);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
   /* each group's box, the chosen one's orange */
-  for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
-    rect r = key(group_rect(g, h.gyro), g);
+  for (int g = 0; g < HUD_EDIT_GROUPS; ++g) {
+    rect r = g == HUD_EDIT_SHIFT ? shift_key(shift_rect(h.gyro)) : key(group_rect(g, h.gyro), g);
     r = (rect){ r.x - 6, r.y - 6, r.w + 12, r.h + 12 };
     if (g == sel) color(1.0f, 0.42f, 0.05f, 0.95f);
     else color(1, 1, 1, 0.35f);

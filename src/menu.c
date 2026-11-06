@@ -1882,11 +1882,14 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
  * puts every group back, DONE (or the back key) back to OPTION. Its key on the OPTION screen
  * on the PEDALS row's right. Its words the HUD's (no pre-rendered ones), in the 1024 x 768
  * layout. ---- */
-enum { LAY_SMALLER, LAY_BIGGER, LAY_RESET, LAY_DONE, LAY_BUTTONS };
-static const float LAY_PANEL[4] = { 272, 228, 480, 270 };
+/* The shift keys are a fourth group (hud.h HUD_EDIT_SHIFT): with the right keys until they are
+ * dragged or sized, or the panel's last key splits them off; they then have their own size and
+ * place (menu.h key_shift_*). RESET ALL puts them back with the right keys. */
+enum { LAY_SMALLER, LAY_BIGGER, LAY_RESET, LAY_DONE, LAY_SHIFT, LAY_BUTTONS };
+static const float LAY_PANEL[4] = { 272, 228, 480, 330 };
 static const float LAY_BUTTON[LAY_BUTTONS][4] = { { 296, 356, 110, 56 }, { 618, 356, 110, 56 }, { 296, 426, 204, 56 },
-                                                  { 524, 426, 204, 56 } };
-static const char *const LAY_GROUP[3] = { "TOP KEYS", "LEFT KEYS", "RIGHT KEYS" };
+                                                  { 524, 426, 204, 56 }, { 296, 496, 432, 48 } };
+static const char *const LAY_GROUP[HUD_EDIT_GROUPS] = { "TOP KEYS", "LEFT KEYS", "RIGHT KEYS", "SHIFT KEYS" };
 /* the OPTION screen's key to it (640 x 480) */
 static const float OPT_LAYOUT_KEY[4] = { 446, 198, 176, 28 };
 #define LAY_K_STEP 10
@@ -1899,21 +1902,42 @@ static int layout_button(float x, float y) {
   return -1;
 }
 
+/* a group's size (percent) and move: the shift keys' (HUD_EDIT_SHIFT) are their own fields */
+static int *layout_k(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_k : &m->key_k[g]; }
+static int *layout_dx(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_dx : &m->key_dx[g]; }
+static int *layout_dy(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_dy : &m->key_dy[g]; }
+
+/* the size the group shows: the shift keys', while they follow the right keys, are theirs */
+static int layout_size(const menu_state *m, int g) {
+  if (g == HUD_EDIT_SHIFT) return m->key_shift_sep ? m->key_shift_k : m->key_k[HUD_KEYS_RIGHT];
+  return m->key_k[g];
+}
+
+/* the shift keys leave the right keys, from where they are (so nothing jumps) */
+static void layout_shift_split(menu_state *m) {
+  if (m->key_shift_sep) return;
+  m->key_shift_sep = 1;
+  m->key_shift_k = m->key_k[HUD_KEYS_RIGHT];
+  m->key_shift_dx = m->key_dx[HUD_KEYS_RIGHT], m->key_shift_dy = m->key_dy[HUD_KEYS_RIGHT];
+}
+
 static void layout_clamp(menu_state *m, int g) {
-  float dx = (float)m->key_dx[g], dy = (float)m->key_dy[g];
-  hud_layout_clamp(g, m->gyro == HUD_STEER_GYRO, (float)m->key_k[g] * 0.01f, &dx, &dy);
-  m->key_dx[g] = (int)floorf(dx + 0.5f), m->key_dy[g] = (int)floorf(dy + 0.5f);
+  int *kx = layout_dx(m, g), *ky = layout_dy(m, g);
+  float dx = (float)*kx, dy = (float)*ky;
+  hud_layout_clamp(g, m->gyro == HUD_STEER_GYRO, (float)*layout_k(m, g) * 0.01f, &dx, &dy);
+  *kx = (int)floorf(dx + 0.5f), *ky = (int)floorf(dy + 0.5f);
 }
 
 static void layout_apply(const menu_state *m) {
   for (int g = 0; g < HUD_KEY_GROUPS; ++g) hud_layout_set(g, (float)m->key_k[g] * 0.01f, (float)m->key_dx[g], (float)m->key_dy[g]);
+  hud_shift_layout_set(m->key_shift_sep, (float)m->key_shift_k * 0.01f, (float)m->key_shift_dx, (float)m->key_shift_dy);
 }
 
 static void layout_enter(menu_state *m) {
   go(m, MENU_LAYOUT);
   m->lay_drag = m->lay_tap = 0;
   m->lay_touch = 0;
-  if (m->lay_sel < 0 || m->lay_sel >= HUD_KEY_GROUPS) m->lay_sel = HUD_KEYS_RIGHT;
+  if (m->lay_sel < 0 || m->lay_sel >= HUD_EDIT_GROUPS) m->lay_sel = HUD_KEYS_RIGHT;
   layout_apply(m);
 }
 
@@ -1931,13 +1955,21 @@ static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
     if (g < 0) return 0;
     m->lay_sel = g;
     m->lay_drag = 1, m->lay_touch = id;
-    m->lay_x = x - (float)m->key_dx[g], m->lay_y = y - (float)m->key_dy[g];
+    if (g == HUD_EDIT_SHIFT) {
+      /* the shift keys are taken from where they are; a tap alone leaves them with the right keys */
+      m->lay_shift_sep_was = m->key_shift_sep;
+      layout_shift_split(m);
+    }
+    m->lay_x = x - (float)*layout_dx(m, g), m->lay_y = y - (float)*layout_dy(m, g);
     return 1;
   }
   if (!m->lay_drag || id != m->lay_touch) return phase != TOUCH_BEGAN;
   int g = m->lay_sel;
-  m->key_dx[g] = (int)floorf(x - m->lay_x + 0.5f), m->key_dy[g] = (int)floorf(y - m->lay_y + 0.5f);
+  *layout_dx(m, g) = (int)floorf(x - m->lay_x + 0.5f), *layout_dy(m, g) = (int)floorf(y - m->lay_y + 0.5f);
   layout_clamp(m, g);
+  if (phase == TOUCH_ENDED && g == HUD_EDIT_SHIFT && !m->lay_shift_sep_was && m->key_shift_dx == m->key_dx[HUD_KEYS_RIGHT] &&
+      m->key_shift_dy == m->key_dy[HUD_KEYS_RIGHT])
+    m->key_shift_sep = 0; /* a tap, or a drag back to where they were: still the right keys' own */
   layout_apply(m);
   if (phase == TOUCH_ENDED) {
     m->lay_drag = 0, m->lay_touch = 0;
@@ -1957,15 +1989,23 @@ static void layout_step(menu_state *m, int back) {
   }
   int g = m->lay_sel;
   if (b == LAY_SMALLER || b == LAY_BIGGER) {
-    int k = m->key_k[g] + (b == LAY_BIGGER ? LAY_K_STEP : -LAY_K_STEP);
+    int k = layout_size(m, g) + (b == LAY_BIGGER ? LAY_K_STEP : -LAY_K_STEP);
     if (k < (int)(HUD_KEY_K_MIN * 100 + 0.5f) || k > (int)(HUD_KEY_K_MAX * 100 + 0.5f)) return;
     snd_menu(SND_CURSOR);
-    m->key_k[g] = k;
+    if (g == HUD_EDIT_SHIFT) layout_shift_split(m); /* sized, they leave the right keys */
+    *layout_k(m, g) = k;
     layout_clamp(m, g);
     m->garage_changed = 1;
   } else if (b == LAY_RESET) {
     snd_menu(SND_SELECT);
     for (int i = 0; i < HUD_KEY_GROUPS; ++i) m->key_k[i] = 100, m->key_dx[i] = m->key_dy[i] = 0;
+    m->key_shift_sep = 0, m->key_shift_k = 100, m->key_shift_dx = m->key_shift_dy = 0;
+    m->garage_changed = 1;
+  } else if (b == LAY_SHIFT) {
+    snd_menu(SND_SELECT);
+    if (m->key_shift_sep) m->key_shift_sep = 0; /* back with the right keys */
+    else layout_shift_split(m);
+    m->lay_sel = HUD_EDIT_SHIFT;
     m->garage_changed = 1;
   }
   layout_apply(m);
@@ -1985,17 +2025,20 @@ static void draw_layout(const menu_state *m, int clock, float screen_w, float sc
   layout_text_mid("KEY LAYOUT", p[1] + 16, 4, 1, 1, 1);
   layout_text_mid("DRAG A GROUP OF KEYS TO MOVE IT", p[1] + 62, 2, 0.8f, 0.8f, 0.8f);
   char line[48];
-  int g = m->lay_sel >= 0 && m->lay_sel < 3 ? m->lay_sel : 0;
+  int g = m->lay_sel >= 0 && m->lay_sel < HUD_EDIT_GROUPS ? m->lay_sel : 0;
   layout_text_mid(LAY_GROUP[g], p[1] + 92, 2.5f, 1.0f, 0.55f, 0.15f);
-  static const char *const LABEL[LAY_BUTTONS] = { "-", "+", "RESET ALL", "DONE" };
+  if (g == HUD_EDIT_SHIFT)
+    layout_text_mid(m->key_shift_sep ? "THEIR OWN SIZE AND PLACE" : "WITH THE RIGHT KEYS", p[1] + 111, 1.8f, 0.8f, 0.8f, 0.8f);
+  /* the last key says what it will do: split the shift keys off, or put them back */
+  const char *LABEL[LAY_BUTTONS] = { "-", "+", "RESET ALL", "DONE", m->key_shift_sep ? "SHIFT BACK WITH RIGHT KEYS" : "SEPARATE THE SHIFT KEYS" };
   for (int b = 0; b < LAY_BUTTONS; ++b) {
     const float *r = LAY_BUTTON[b];
-    float px = b < 2 ? 5.0f : 3.0f;
+    float px = b < 2 ? 5.0f : b == LAY_SHIFT ? 2.5f : 3.0f;
     hud_ui_button(r[0], r[1], r[2], r[3], m->lay_tap == b + 1);
     hud_ui_text(LABEL[b], r[0] + 0.5f * (r[2] - hud_ui_text_width(LABEL[b], px)), r[1] + 0.5f * (r[3] - 7.0f * px), px, 1, 1,
                 1, 1);
   }
-  snprintf(line, sizeof line, "SIZE %d", m->key_k[g]);
+  snprintf(line, sizeof line, "SIZE %d", layout_size(m, g));
   layout_text_mid(line, LAY_BUTTON[0][1] + 0.5f * (LAY_BUTTON[0][3] - 7.0f * 3), 3, 1, 1, 1);
   hud_ui_end();
   layout_apply(m);
@@ -5203,6 +5246,7 @@ void menu_init(menu_state *m) {
   menu_garage_reset(m);
   m->gyro = 0, m->gyro_sens = 5, m->over_on = 1, m->sharp_on = 1, m->ao_on = 1, m->bm_on = 1;
   for (int g = 0; g < 3; ++g) m->key_k[g] = 100, m->key_dx[g] = m->key_dy[g] = 0;
+  m->key_shift_sep = 0, m->key_shift_k = 100, m->key_shift_dx = m->key_shift_dy = 0;
   m->poem = -1;
   /* (the SSAO off: its 20 ms on the Mi 6 cost the 60 fps) */
   m->hd_tex = 1, m->bloom_on = 1, m->ssao_on = 0, m->wet_on = 1, m->paint_on = 1, m->aa4 = 1;

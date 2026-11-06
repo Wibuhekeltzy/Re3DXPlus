@@ -188,6 +188,10 @@ typedef struct {
    * options; the editor's chosen group, the finger dragging it (lay_drag) from where (lay_x, y
    * less the group's move), and a button of its panel tapped (lay_tap, 1 + LAY_*) */
   int key_k[3], key_dx[3], key_dy[3];
+  /* the shift keys' own (hud.h HUD_EDIT_SHIFT, the fourth group): once key_shift_sep they have
+   * their own size, move and place (key_shift_k, _dx, _dy), else they follow the right keys;
+   * kept with the options; lay_shift_sep_was the one before a finger took them */
+  int key_shift_sep, key_shift_k, key_shift_dx, key_shift_dy, lay_shift_sep_was;
   int lay_sel, lay_drag, lay_tap;
   void *lay_touch;
   float lay_x, lay_y;

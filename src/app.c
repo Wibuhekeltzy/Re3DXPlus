@@ -894,6 +894,14 @@ static int options_load(void) {
   int test = 0, traffic = 0;
   if (n >= 3 && fscanf(f, " test %d", &test) == 1) G.menu.story_test = test >= 0 && test <= 10 ? test : 0;
   if (n >= 3 && fscanf(f, " traffic %d", &traffic) == 1) G.menu.ta_traffic = traffic != 0;
+  /* the shift keys' own size and place (menu.h key_shift_*), a fourth line: separate, size percent, move */
+  int sh[4];
+  if (n >= 3 && fscanf(f, " shift %d %d %d %d", &sh[0], &sh[1], &sh[2], &sh[3]) == 4) {
+    G.menu.key_shift_sep = sh[0] != 0;
+    G.menu.key_shift_k = sh[1] < 60 ? 60 : sh[1] > 160 ? 160 : sh[1];
+    G.menu.key_shift_dx = sh[2] < -2000 || sh[2] > 2000 ? 0 : sh[2];
+    G.menu.key_shift_dy = sh[3] < -2000 || sh[3] > 2000 ? 0 : sh[3];
+  }
   fclose(f);
   if (n < 3) return 0;
   G.menu.hires = hires != 0;
@@ -910,14 +918,15 @@ static int options_load(void) {
 }
 
 static void options_save(void) {
-  static int last[25] = { -1 };
-  int now[25] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
+  static int last[29] = { -1 };
+  int now[29] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
                   G.menu.bm_on, G.menu.hd_tex, G.menu.bloom_on, G.menu.ssao_on, G.menu.wet_on, G.menu.paint_on,
                   G.menu.aa4, G.menu.hires };
   for (int g = 0; g < 3; ++g)
     now[14 + g * 3] = G.menu.key_k[g], now[15 + g * 3] = G.menu.key_dx[g], now[16 + g * 3] = G.menu.key_dy[g];
   now[23] = G.menu.story_test;
   now[24] = G.menu.ta_traffic;
+  now[25] = G.menu.key_shift_sep, now[26] = G.menu.key_shift_k, now[27] = G.menu.key_shift_dx, now[28] = G.menu.key_shift_dy;
   if (G.options_global && !memcmp(now, last, sizeof now)) return;
   char path[1100];
   snprintf(path, sizeof path, "%s/option", G.save_dir);
@@ -929,6 +938,7 @@ static void options_save(void) {
           now[22]);
   fprintf(f, "test %d\n", now[23]);
   fprintf(f, "traffic %d\n", now[24]);
+  fprintf(f, "shift %d %d %d %d\n", now[25], now[26], now[27], now[28]);
   fclose(f);
   memcpy(last, now, sizeof last);
   G.options_global = 1;
@@ -1460,6 +1470,8 @@ static void hud_options(void) {
   /* the KEY LAYOUT's (menu.c MENU_LAYOUT) */
   for (int g = 0; g < HUD_KEY_GROUPS; ++g)
     hud_layout_set(g, (float)G.menu.key_k[g] * 0.01f, (float)G.menu.key_dx[g], (float)G.menu.key_dy[g]);
+  hud_shift_layout_set(G.menu.key_shift_sep, (float)G.menu.key_shift_k * 0.01f, (float)G.menu.key_shift_dx,
+                       (float)G.menu.key_shift_dy);
 }
 
 void app_press_start(void) {
