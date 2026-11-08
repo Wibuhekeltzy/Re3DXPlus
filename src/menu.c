@@ -1887,41 +1887,78 @@ static void draw_option_res(const menu_state *m, float screen_w, float screen_h)
   hud_ui_end();
 }
 
-/* ---- the OPTION screen's KEY LAYOUT (MENU_LAYOUT, Allan 10-29: the touch keys' size and
- * place the player's own): the race's keys over the screen as they will be, a group dragged
- * by a finger moves (kept on the screen), the panel's - and + size the chosen group, RESET ALL
- * puts every group back, DONE (or the back key) back to OPTION. Its key on the OPTION screen
- * on the PEDALS row's right. Its words the HUD's (no pre-rendered ones), in the 1024 x 768
- * layout. ---- */
-/* The shift keys are a fourth group (hud.h HUD_EDIT_SHIFT): with the right keys until they are
- * dragged or sized, or the panel's last key splits them off; they then have their own size and
- * place (menu.h key_shift_*). RESET ALL puts them back with the right keys. */
-enum { LAY_SMALLER, LAY_BIGGER, LAY_RESET, LAY_DONE, LAY_SHIFT, LAY_BUTTONS };
-static const float LAY_PANEL[4] = { 272, 228, 480, 330 };
-static const float LAY_BUTTON[LAY_BUTTONS][4] = { { 296, 356, 110, 56 }, { 618, 356, 110, 56 }, { 296, 426, 204, 56 },
-                                                  { 524, 426, 204, 56 }, { 296, 496, 432, 48 } };
-static const char *const LAY_GROUP[HUD_EDIT_GROUPS] = { "TOP KEYS", "LEFT KEYS", "RIGHT KEYS", "SHIFT KEYS" };
+/* ---- the OPTION screen's KEY LAYOUT (MENU_LAYOUT, Allan 10-29, with the 1.31's editor): the race's
+ * touch keys and consoles over the screen as they will be, on two pages (the panel's first key):
+ * the KEYS (top, left, right and the shift keys) and the HUD (the race's map, rank, time and meters,
+ * hud.h HUD_RACE_*). A group dragged by a finger moves (kept on the screen), or by the panel's DRAG
+ * TO MOVE bar when the panel is over it; the panel's < and > choose a group, - and + size it,
+ * RESET GROUP puts it back and RESET KEYS / RESET HUD the page, DONE (or the back key) back to
+ * OPTION. With the stick for the steering, the left keys' group also has the stick's dead zone (the
+ * second - and +) and its centre (floating at the thumb or fixed at the wheel's place). Its key on
+ * the OPTION screen on the PEDALS row's right. Its words the HUD's (no pre-rendered ones), in the
+ * 1024 x 768 layout. ---- */
+/* The shift keys are the keys page's fourth group (hud.h HUD_EDIT_SHIFT): with the right keys
+ * until they are dragged or sized; they then have their own size and place (menu.h key_shift_*).
+ * RESET GROUP on them puts them back with the right keys. */
+enum {
+  LAY_PAGE, LAY_PREV, LAY_NEXT, LAY_SMALLER, LAY_BIGGER, LAY_DEAD_MINUS, LAY_DEAD_PLUS, LAY_RESET, LAY_RESET_ALL, LAY_DONE,
+  LAY_CENTER, LAY_BUTTONS
+};
+static const float LAY_PANEL[4] = { 272, 198, 480, 380 };
+static const float LAY_BUTTON[LAY_BUTTONS][4] = {
+  { 296, 238, 432, 38 }, { 296, 283, 80, 38 },  { 648, 283, 80, 38 },  { 296, 328, 80, 38 },
+  { 648, 328, 80, 38 },  { 296, 373, 80, 38 },  { 648, 373, 80, 38 },  { 296, 418, 204, 38 },
+  { 524, 418, 204, 38 }, { 296, 506, 432, 45 }, { 296, 554, 432, 22 },
+};
+/* the bar a group is dragged by from under the panel */
+static const float LAY_HANDLE[4] = { 392, 462, 240, 30 };
+static const char *const LAY_KEYS_NAME[HUD_EDIT_GROUPS] = { "TOP KEYS", "LEFT KEYS", "RIGHT KEYS", "SHIFT KEYS" };
+static const char *const LAY_HUD_NAME[HUD_RACE_GROUPS] = { "MAP", "RANK", "TIME", "METER" };
 /* the OPTION screen's key to it (640 x 480) */
 static const float OPT_LAYOUT_KEY[4] = { 446, 198, 176, 28 };
 #define LAY_K_STEP 10
+#define LAY_STICK_DEAD 8 /* the stick's dead zone, percent, as it comes */
+typedef char lay_race_groups_are_four[HUD_RACE_GROUPS == 4 ? 1 : -1]; /* (menu.h's hud_k[4]) */
 
 static int layout_button(float x, float y) {
   for (int b = 0; b < LAY_BUTTONS; ++b) {
     const float *r = LAY_BUTTON[b];
-    if (x >= r[0] - 6 && x < r[0] + r[2] + 6 && y >= r[1] - 6 && y < r[1] + r[3] + 6) return b;
+    if (x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]) return b;
   }
   return -1;
 }
 
-/* a group's size (percent) and move: the shift keys' (HUD_EDIT_SHIFT) are their own fields */
-static int *layout_k(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_k : &m->key_k[g]; }
-static int *layout_dx(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_dx : &m->key_dx[g]; }
-static int *layout_dy(menu_state *m, int g) { return g == HUD_EDIT_SHIFT ? &m->key_shift_dy : &m->key_dy[g]; }
+/* the page's groups: the keys' four, or the race's consoles */
+static int layout_count(const menu_state *m) { return m->lay_page ? HUD_RACE_GROUPS : HUD_EDIT_GROUPS; }
+static int layout_valid(const menu_state *m, int g) { return g >= 0 && g < layout_count(m); }
+
+/* a group's size (percent) and move: the shift keys' (HUD_EDIT_SHIFT) are their own fields, the
+ * consoles' the second page's */
+static int *layout_k(menu_state *m, int g) {
+  return m->lay_page ? &m->hud_k[g] : g == HUD_EDIT_SHIFT ? &m->key_shift_k : &m->key_k[g];
+}
+static int *layout_dx(menu_state *m, int g) {
+  return m->lay_page ? &m->hud_dx[g] : g == HUD_EDIT_SHIFT ? &m->key_shift_dx : &m->key_dx[g];
+}
+static int *layout_dy(menu_state *m, int g) {
+  return m->lay_page ? &m->hud_dy[g] : g == HUD_EDIT_SHIFT ? &m->key_shift_dy : &m->key_dy[g];
+}
 
 /* the size the group shows: the shift keys', while they follow the right keys, are theirs */
 static int layout_size(const menu_state *m, int g) {
+  if (m->lay_page) return m->hud_k[g];
   if (g == HUD_EDIT_SHIFT) return m->key_shift_sep ? m->key_shift_k : m->key_k[HUD_KEYS_RIGHT];
   return m->key_k[g];
+}
+
+/* the stick's dead zone and centre are the left keys' group's, with the stick for the steering */
+static int layout_stick_group(const menu_state *m) {
+  return !m->lay_page && m->gyro == HUD_STEER_STICK && m->lay_sel == HUD_KEYS_LEFT;
+}
+
+/* a panel key in use: the stick's (the dead zone's two and CENTER) only on the stick's group */
+static int layout_button_on(const menu_state *m, int b) {
+  return b == LAY_DEAD_MINUS || b == LAY_DEAD_PLUS || b == LAY_CENTER ? layout_stick_group(m) : 1;
 }
 
 /* the shift keys leave the right keys, from where they are (so nothing jumps) */
@@ -1934,89 +1971,141 @@ static void layout_shift_split(menu_state *m) {
 
 static void layout_clamp(menu_state *m, int g) {
   int *kx = layout_dx(m, g), *ky = layout_dy(m, g);
-  float dx = (float)*kx, dy = (float)*ky;
-  hud_layout_clamp(g, m->gyro == HUD_STEER_GYRO, (float)*layout_k(m, g) * 0.01f, &dx, &dy);
+  float dx = (float)*kx, dy = (float)*ky, k = (float)*layout_k(m, g) * 0.01f;
+  if (m->lay_page) hud_race_layout_clamp(g, k, &dx, &dy);
+  else hud_layout_clamp_mode(g, m->gyro, k, &dx, &dy);
   *kx = (int)floorf(dx + 0.5f), *ky = (int)floorf(dy + 0.5f);
 }
 
 static void layout_apply(const menu_state *m) {
   for (int g = 0; g < HUD_KEY_GROUPS; ++g) hud_layout_set(g, (float)m->key_k[g] * 0.01f, (float)m->key_dx[g], (float)m->key_dy[g]);
   hud_shift_layout_set(m->key_shift_sep, (float)m->key_shift_k * 0.01f, (float)m->key_shift_dx, (float)m->key_shift_dy);
+  for (int g = 0; g < HUD_RACE_GROUPS; ++g)
+    hud_race_layout_set(g, (float)m->hud_k[g] * 0.01f, (float)m->hud_dx[g], (float)m->hud_dy[g]);
+  hud_set_stick_deadzone_percent(m->stick_dead);
 }
 
 static void layout_enter(menu_state *m) {
   go(m, MENU_LAYOUT);
-  m->lay_drag = m->lay_tap = 0;
+  m->lay_drag = m->lay_tap = m->lay_button_down = 0;
   m->lay_touch = 0;
-  if (m->lay_sel < 0 || m->lay_sel >= HUD_EDIT_GROUPS) m->lay_sel = HUD_KEYS_RIGHT;
+  m->lay_page = 0;
+  m->lay_sel = HUD_KEYS_RIGHT;
   layout_apply(m);
 }
 
-/* its touches (menu_touch's, all phases): a panel button, or a group taken and dragged; 0 for
- * one not its own (the back key's) */
+/* its touches (menu_touch's, all phases): a panel button (pressed, and tapped by letting go on
+ * it), or a group taken and dragged (by its place or the panel's bar); 0 for one not its own
+ * (the back key's) */
 static int layout_touch(menu_state *m, void *id, int phase, float x, float y) {
-  if (phase == TOUCH_BEGAN && !m->lay_drag) {
+  if (phase == TOUCH_BEGAN) {
+    if (!id || m->lay_touch || m->lay_tap) return 1; /* one finger at a time */
     int b = layout_button(x, y);
     if (b >= 0) {
-      m->lay_tap = b + 1;
+      if (layout_button_on(m, b)) m->lay_touch = id, m->lay_button_down = b + 1;
       return 1;
     }
+    const float *hd = LAY_HANDLE, *p = LAY_PANEL;
+    int handle = x >= hd[0] && x < hd[0] + hd[2] && y >= hd[1] && y < hd[1] + hd[3];
+    if (!handle && x >= p[0] && x <= p[0] + p[2] && y >= p[1] && y <= p[1] + p[3]) return 1; /* the panel's own */
     layout_apply(m);
-    int g = hud_layout_hit(m->gyro == HUD_STEER_GYRO, x, y);
-    if (g < 0) return 0;
+    int g = handle ? m->lay_sel : m->lay_page ? hud_race_layout_hit(x, y) : hud_layout_hit_mode(m->gyro, x, y);
+    if (!layout_valid(m, g)) return handle;
     m->lay_sel = g;
     m->lay_drag = 1, m->lay_touch = id;
-    if (g == HUD_EDIT_SHIFT) {
+    if (!m->lay_page && g == HUD_EDIT_SHIFT) {
       /* the shift keys are taken from where they are; a tap alone leaves them with the right keys */
       m->lay_shift_sep_was = m->key_shift_sep;
       layout_shift_split(m);
     }
-    m->lay_x = x - (float)*layout_dx(m, g), m->lay_y = y - (float)*layout_dy(m, g);
+    m->lay_old_dx = *layout_dx(m, g), m->lay_old_dy = *layout_dy(m, g);
+    m->lay_x = x, m->lay_y = y;
     return 1;
   }
-  if (!m->lay_drag || id != m->lay_touch) return phase != TOUCH_BEGAN;
-  int g = m->lay_sel;
-  *layout_dx(m, g) = (int)floorf(x - m->lay_x + 0.5f), *layout_dy(m, g) = (int)floorf(y - m->lay_y + 0.5f);
-  layout_clamp(m, g);
-  if (phase == TOUCH_ENDED && g == HUD_EDIT_SHIFT && !m->lay_shift_sep_was && m->key_shift_dx == m->key_dx[HUD_KEYS_RIGHT] &&
-      m->key_shift_dy == m->key_dy[HUD_KEYS_RIGHT])
-    m->key_shift_sep = 0; /* a tap, or a drag back to where they were: still the right keys' own */
-  layout_apply(m);
-  if (phase == TOUCH_ENDED) {
-    m->lay_drag = 0, m->lay_touch = 0;
-    m->garage_changed = 1;
+  if (!id || id != m->lay_touch) return phase != TOUCH_BEGAN;
+  if (m->lay_drag && layout_valid(m, m->lay_sel)) {
+    int g = m->lay_sel, *dx = layout_dx(m, g), *dy = layout_dy(m, g);
+    if (phase == TOUCH_CANCELLED) { /* the system took the finger: the group stays where it was */
+      *dx = m->lay_old_dx, *dy = m->lay_old_dy;
+      if (!m->lay_page && g == HUD_EDIT_SHIFT) m->key_shift_sep = m->lay_shift_sep_was;
+    } else {
+      if (x == m->lay_x && y == m->lay_y) { /* a tap, or a drag back to its start: exactly as it was */
+        *dx = m->lay_old_dx, *dy = m->lay_old_dy;
+      } else {
+        *dx = (int)floorf((float)m->lay_old_dx + x - m->lay_x + 0.5f);
+        *dy = (int)floorf((float)m->lay_old_dy + y - m->lay_y + 0.5f);
+        layout_clamp(m, g);
+      }
+      int changed = *dx != m->lay_old_dx || *dy != m->lay_old_dy;
+      if (!m->lay_page && g == HUD_EDIT_SHIFT) m->key_shift_sep = m->lay_shift_sep_was || changed;
+      if (phase == TOUCH_ENDED && changed) m->garage_changed = 1;
+    }
+    layout_apply(m);
+  } else if (m->lay_button_down && phase == TOUCH_ENDED && layout_button(x, y) + 1 == m->lay_button_down) {
+    m->lay_tap = m->lay_button_down;
   }
+  if (phase == TOUCH_ENDED || phase == TOUCH_CANCELLED) m->lay_drag = 0, m->lay_touch = 0, m->lay_button_down = 0;
   return 1;
+}
+
+/* a group back to its own place and size (the shift keys back with the right keys) */
+static void layout_reset_group(menu_state *m, int g) {
+  if (m->lay_page) {
+    m->hud_k[g] = 100, m->hud_dx[g] = m->hud_dy[g] = 0;
+  } else if (g == HUD_EDIT_SHIFT) {
+    m->key_shift_sep = 0, m->key_shift_k = 100, m->key_shift_dx = m->key_shift_dy = 0;
+  } else {
+    m->key_k[g] = 100, m->key_dx[g] = m->key_dy[g] = 0;
+  }
 }
 
 static void layout_step(menu_state *m, int back) {
   int b = m->lay_tap - 1;
   m->lay_tap = 0;
   if (back || b == LAY_DONE) {
+    if (m->lay_drag && m->lay_touch) layout_touch(m, m->lay_touch, TOUCH_CANCELLED, 0, 0);
     snd_menu(SND_CANCEL);
-    m->lay_drag = 0, m->lay_touch = 0;
+    m->lay_drag = 0, m->lay_touch = 0, m->lay_button_down = 0;
     go(m, MENU_OPTION);
     return;
   }
+  if (!layout_valid(m, m->lay_sel)) m->lay_sel = 0;
   int g = m->lay_sel;
-  if (b == LAY_SMALLER || b == LAY_BIGGER) {
+  if (b == LAY_PAGE) {
+    snd_menu(SND_CURSOR);
+    m->lay_page = !m->lay_page;
+    m->lay_sel = m->lay_page ? HUD_RACE_MAP : HUD_KEYS_RIGHT;
+  } else if (b == LAY_PREV || b == LAY_NEXT) {
+    snd_menu(SND_CURSOR);
+    m->lay_sel = (g + layout_count(m) + (b == LAY_NEXT ? 1 : -1)) % layout_count(m);
+  } else if (b == LAY_CENTER && layout_stick_group(m)) {
+    snd_menu(SND_SELECT);
+    m->stick_fixed = !m->stick_fixed;
+    m->garage_changed = 1;
+  } else if ((b == LAY_DEAD_MINUS || b == LAY_DEAD_PLUS) && layout_stick_group(m)) {
+    int n = m->stick_dead + (b == LAY_DEAD_PLUS ? 1 : -1);
+    if (n < 0 || n > 50) return;
+    snd_menu(SND_CURSOR);
+    m->stick_dead = n;
+    m->garage_changed = 1;
+  } else if (b == LAY_SMALLER || b == LAY_BIGGER) {
     int k = layout_size(m, g) + (b == LAY_BIGGER ? LAY_K_STEP : -LAY_K_STEP);
     if (k < (int)(HUD_KEY_K_MIN * 100 + 0.5f) || k > (int)(HUD_KEY_K_MAX * 100 + 0.5f)) return;
+    /* a console only as big as the screen takes it */
+    if (m->lay_page && b == LAY_BIGGER && (float)k * 0.01f > hud_race_layout_max_scale(g)) return;
     snd_menu(SND_CURSOR);
-    if (g == HUD_EDIT_SHIFT) layout_shift_split(m); /* sized, they leave the right keys */
+    if (!m->lay_page && g == HUD_EDIT_SHIFT) layout_shift_split(m); /* sized, they leave the right keys */
     *layout_k(m, g) = k;
     layout_clamp(m, g);
     m->garage_changed = 1;
   } else if (b == LAY_RESET) {
     snd_menu(SND_SELECT);
-    for (int i = 0; i < HUD_KEY_GROUPS; ++i) m->key_k[i] = 100, m->key_dx[i] = m->key_dy[i] = 0;
-    m->key_shift_sep = 0, m->key_shift_k = 100, m->key_shift_dx = m->key_shift_dy = 0;
+    layout_reset_group(m, g);
     m->garage_changed = 1;
-  } else if (b == LAY_SHIFT) {
+  } else if (b == LAY_RESET_ALL) {
     snd_menu(SND_SELECT);
-    if (m->key_shift_sep) m->key_shift_sep = 0; /* back with the right keys */
-    else layout_shift_split(m);
-    m->lay_sel = HUD_EDIT_SHIFT;
+    for (int i = 0; i < layout_count(m); ++i) layout_reset_group(m, i);
+    if (!m->lay_page) m->stick_dead = LAY_STICK_DEAD, m->stick_fixed = 0; /* the stick's, with the keys */
     m->garage_changed = 1;
   }
   layout_apply(m);
@@ -2029,31 +2118,43 @@ static void layout_text_mid(const char *s, float y, float px, float r, float g, 
 static void draw_layout(const menu_state *m, int clock, float screen_w, float screen_h) {
   draw_back(ID.bg, clock % 600, 1);
   anm_fill(0, 0, 0, 0.6f);
+  layout_apply(m);
+  int g = layout_valid(m, m->lay_sel) ? m->lay_sel : 0;
+  /* the groups as they will be, the panel over them */
+  if (m->lay_page) hud_draw_race_layout(screen_w, screen_h, g);
+  else hud_draw_layout_mode(screen_w, screen_h, m->gyro, g);
   hud_ui_begin(screen_w, screen_h);
   const float *p = LAY_PANEL;
-  hud_ui_rect(p[0], p[1], p[2], p[3], 0.03f, 0.04f, 0.06f, 0.82f);
+  hud_ui_rect(p[0], p[1], p[2], p[3], 0.03f, 0.04f, 0.06f, 0.90f);
   hud_ui_rect(p[0], p[1], p[2], 3, 1.0f, 0.42f, 0.05f, 0.95f);
-  layout_text_mid("KEY LAYOUT", p[1] + 16, 4, 1, 1, 1);
-  layout_text_mid("DRAG A GROUP OF KEYS TO MOVE IT", p[1] + 62, 2, 0.8f, 0.8f, 0.8f);
-  char line[48];
-  int g = m->lay_sel >= 0 && m->lay_sel < HUD_EDIT_GROUPS ? m->lay_sel : 0;
-  layout_text_mid(LAY_GROUP[g], p[1] + 92, 2.5f, 1.0f, 0.55f, 0.15f);
-  if (g == HUD_EDIT_SHIFT)
-    layout_text_mid(m->key_shift_sep ? "THEIR OWN SIZE AND PLACE" : "WITH THE RIGHT KEYS", p[1] + 111, 1.8f, 0.8f, 0.8f, 0.8f);
-  /* the last key says what it will do: split the shift keys off, or put them back */
-  const char *LABEL[LAY_BUTTONS] = { "-", "+", "RESET ALL", "DONE", m->key_shift_sep ? "SHIFT BACK WITH RIGHT KEYS" : "SEPARATE THE SHIFT KEYS" };
+  layout_text_mid("LAYOUT EDITOR", p[1] + 10, 3, 1, 1, 1);
+  static const char *const LABEL[LAY_BUTTONS] = { "KEYS / HUD", "<", ">", "-", "+", "-", "+", "RESET GROUP", "", "DONE", "" };
   for (int b = 0; b < LAY_BUTTONS; ++b) {
+    if (!layout_button_on(m, b)) continue;
     const float *r = LAY_BUTTON[b];
-    float px = b < 2 ? 5.0f : b == LAY_SHIFT ? 2.5f : 3.0f;
-    hud_ui_button(r[0], r[1], r[2], r[3], m->lay_tap == b + 1);
-    hud_ui_text(LABEL[b], r[0] + 0.5f * (r[2] - hud_ui_text_width(LABEL[b], px)), r[1] + 0.5f * (r[3] - 7.0f * px), px, 1, 1,
-                1, 1);
+    float px = b == LAY_CENTER ? 1.7f : 2.2f;
+    const char *text = b == LAY_CENTER      ? (m->stick_fixed ? "STATIC - TAP FOR FLOAT" : "FLOAT - TAP FOR STATIC")
+                       : b == LAY_RESET_ALL ? (m->lay_page ? "RESET HUD" : "RESET KEYS")
+                                            : LABEL[b];
+    hud_ui_button(r[0], r[1], r[2], r[3], m->lay_tap == b + 1 || m->lay_button_down == b + 1);
+    hud_ui_text(text, r[0] + 0.5f * (r[2] - hud_ui_text_width(text, px)), r[1] + 0.5f * (r[3] - 7 * px), px, 1, 1, 1, 1);
   }
-  snprintf(line, sizeof line, "SIZE %d", layout_size(m, g));
-  layout_text_mid(line, LAY_BUTTON[0][1] + 0.5f * (LAY_BUTTON[0][3] - 7.0f * 3), 3, 1, 1, 1);
+  char line[80];
+  snprintf(line, sizeof line, "%s: %s", m->lay_page ? "HUD" : "KEYS", m->lay_page ? LAY_HUD_NAME[g] : LAY_KEYS_NAME[g]);
+  layout_text_mid(line, 293, 2, 1, 0.65f, 0.2f);
+  snprintf(line, sizeof line, "SIZE %d PCT", layout_size(m, g));
+  layout_text_mid(line, 338, 2, 1, 1, 1);
+  if (layout_stick_group(m)) {
+    snprintf(line, sizeof line, "DEADZONE %d PCT", m->stick_dead);
+    layout_text_mid(line, 383, 2, 1, 1, 1);
+  } else if (!m->lay_page && g == HUD_EDIT_SHIFT) {
+    layout_text_mid(m->key_shift_sep ? "SHIFT SEPARATE" : "SHIFT FOLLOWS RIGHT", 383, 1.8f, 1, 1, 1);
+  } else {
+    layout_text_mid("DRAG GROUP TO MOVE", 383, 1.8f, 1, 1, 1);
+  }
+  hud_ui_button(LAY_HANDLE[0], LAY_HANDLE[1], LAY_HANDLE[2], LAY_HANDLE[3], m->lay_drag);
+  layout_text_mid("DRAG TO MOVE", LAY_HANDLE[1] + 7, 2, 1, 1, 1);
   hud_ui_end();
-  layout_apply(m);
-  hud_draw_layout(screen_w, screen_h, m->gyro, g);
 }
 
 /* the OPTION screen's key to KEY LAYOUT (its words the HUD's, over the bars like RESOLUTION's) */
@@ -5276,6 +5377,8 @@ void menu_init(menu_state *m) {
   m->gyro = 0, m->gyro_sens = 5, m->over_on = 1, m->sharp_on = 1, m->ao_on = 1, m->bm_on = 1;
   for (int g = 0; g < 3; ++g) m->key_k[g] = 100, m->key_dx[g] = m->key_dy[g] = 0;
   m->key_shift_sep = 0, m->key_shift_k = 100, m->key_shift_dx = m->key_shift_dy = 0;
+  for (int g = 0; g < 4; ++g) m->hud_k[g] = 100, m->hud_dx[g] = m->hud_dy[g] = 0; /* (the HUD page: HUD_RACE_*) */
+  m->stick_dead = LAY_STICK_DEAD, m->stick_fixed = 0;
   m->poem = -1;
   /* (the SSAO off: its 20 ms on the Mi 6 cost the 60 fps) */
   m->hd_tex = 1, m->bloom_on = 1, m->ssao_on = 0, m->wet_on = 1, m->paint_on = 1, m->aa4 = 1;

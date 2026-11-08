@@ -41,7 +41,12 @@ static rect TRANS = { 176, 12, 48, 48 }; /* AT/MT */
 #define WHEEL_LOCK 1.5708f /* a quarter turn: full lock */
 static const rect STICK_ZONE = { 0, 430, 430, 338 };
 #define STICK_R 90.0f   /* the knob's reach: full lock */
-#define STICK_DEAD 0.08f
+static float stick_dead = 0.08f; /* the dead zone's share of the reach (hud_set_stick_deadzone_percent) */
+void hud_set_stick_deadzone_percent(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 50) percent = 50;
+  stick_dead = (float)percent * 0.01f;
+}
 /* the gyro layout: the brake where the steer buttons were, the shift buttons where the brake was */
 static const rect G_BRAKE = { 16, 604, 250, 150 };
 static const rect G_SHIFT_UP = { 812, 610, 96, 68 };
@@ -135,18 +140,68 @@ void hud_init(hud_state *h, float screen_w, float screen_h) {
   h->screen_h = screen_h;
 }
 
-/* the wheel's or the stick's finger: down in its place, on as it moves, off when lifted */
+void hud_set_steer_mode(hud_state *h, int mode) {
+  if (mode < HUD_STEER_KEYS || mode > HUD_STEER_STICK) mode = HUD_STEER_KEYS;
+  if (h->steer_mode == mode && h->gyro == (mode == HUD_STEER_GYRO)) return;
+  h->steer_mode = mode;
+  h->gyro = mode == HUD_STEER_GYRO;
+  /* no finger stays on a control that is gone: nothing held down, nothing turned */
+  h->left_touch = h->right_touch = h->steer_touch = NULL;
+  h->throttle_touch = h->brake_touch = NULL;
+  h->steer_v = h->wheel_turn = h->wheel_last = 0;
+}
+
+void hud_set_stick_center_mode(hud_state *h, int mode) {
+  mode = mode == HUD_STICK_FIXED ? HUD_STICK_FIXED : HUD_STICK_FLOAT;
+  if (h->stick_center_mode == mode) return;
+  h->stick_center_mode = mode;
+  if (h->steer_mode == HUD_STEER_STICK) { /* the finger on it is let go */
+    h->steer_touch = NULL;
+    h->steer_v = h->wheel_turn = h->wheel_last = 0;
+  }
+}
+
+/* the stick's knob to the finger at (lx, ly) (layout px of the left keys): its reach, and the
+ * steer past the dead zone */
+static void stick_position(hud_state *h, float lx, float ly) {
+  float dx = lx - h->stick_x0, dy = ly - h->stick_y0, r = sqrtf(dx * dx + dy * dy);
+  if (r > STICK_R) dx *= STICK_R / r, dy *= STICK_R / r;
+  h->stick_x = h->stick_x0 + dx, h->stick_y = h->stick_y0 + dy;
+  float v = dx / STICK_R, a = fabsf(v);
+  a = a <= stick_dead ? 0.0f : (a - stick_dead) / (1.0f - stick_dead);
+  h->steer_v = v < 0 ? -a : a;
+}
+
+/* the wheel's or the stick's finger: down in its place, on as it moves, off when lifted (the
+ * stick goes with it; the wheel turns back by hud_input_dt, but at once if the touch was
+ * cancelled) */
 static int steer_touch(hud_state *h, void *id, int phase, float x, float y) {
-  if (h->steer_mode != HUD_STEER_WHEEL && h->steer_mode != HUD_STEER_STICK) return 0;
+  if (!id) return 0;
+  if (id == h->steer_touch && phase != TOUCH_BEGAN && phase != TOUCH_MOVED) {
+    h->steer_touch = NULL;
+    if (phase == TOUCH_CANCELLED || h->steer_mode == HUD_STEER_STICK) h->steer_v = h->wheel_turn = 0;
+    return 1;
+  }
+  if (h->gyro || (h->steer_mode != HUD_STEER_WHEEL && h->steer_mode != HUD_STEER_STICK)) return 0;
   float lx, ly;
   unkey(KEY_LEFT, x, y, &lx, &ly);
   int wheel = h->steer_mode == HUD_STEER_WHEEL;
   if (phase == TOUCH_BEGAN && !h->steer_touch) {
     float dx = lx - WHEEL_CX, dy = ly - WHEEL_CY;
-    if (wheel ? dx * dx + dy * dy > WHEEL_R * WHEEL_R * 1.3f : !inside(STICK_ZONE, lx, ly)) return 0;
+    /* a fixed stick takes a thumb near its base (the ring and a little more), a floating one
+     * anywhere in its zone */
+    if (wheel ? dx * dx + dy * dy > WHEEL_R * WHEEL_R * 1.3f
+              : h->stick_center_mode == HUD_STICK_FIXED ? dx * dx + dy * dy > (STICK_R + 20) * (STICK_R + 20)
+                                                        : !inside(STICK_ZONE, lx, ly))
+      return 0;
     h->steer_touch = id;
     h->wheel_last = atan2f(dy, dx);
-    h->stick_x0 = h->stick_x = lx, h->stick_y0 = h->stick_y = ly;
+    if (!wheel && h->stick_center_mode == HUD_STICK_FIXED) {
+      h->stick_x0 = WHEEL_CX, h->stick_y0 = WHEEL_CY;
+      stick_position(h, lx, ly);
+    } else {
+      h->stick_x0 = h->stick_x = lx, h->stick_y0 = h->stick_y = ly;
+    }
     return 1;
   }
   if (id != h->steer_touch) return 0;
@@ -161,18 +216,8 @@ static int steer_touch(hud_state *h, void *id, int phase, float x, float y) {
       h->wheel_turn = fmaxf(-WHEEL_LOCK, fminf(WHEEL_LOCK, h->wheel_turn));
       h->steer_v = h->wheel_turn / WHEEL_LOCK;
     } else {
-      float dx = lx - h->stick_x0, dy = ly - h->stick_y0, r = sqrtf(dx * dx + dy * dy);
-      if (r > STICK_R) dx *= STICK_R / r, dy *= STICK_R / r;
-      h->stick_x = h->stick_x0 + dx, h->stick_y = h->stick_y0 + dy;
-      float v = dx / STICK_R, a = fabsf(v);
-      a = a <= STICK_DEAD ? 0.0f : (a - STICK_DEAD) / (1.0f - STICK_DEAD);
-      h->steer_v = v < 0 ? -a : a;
+      stick_position(h, lx, ly);
     }
-    return 1;
-  }
-  if (phase != TOUCH_BEGAN) { /* lifted: the stick gone (the wheel turns back: hud_input) */
-    h->steer_touch = 0;
-    if (!wheel) h->steer_v = 0;
   }
   return 1;
 }
@@ -206,8 +251,8 @@ void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
     else if (id == h->right_touch && inside(left, x, y)) { h->right_touch = 0; h->left_touch = id; }
   }
   /* slider pedals: the finger's height (held on past the key's top or foot) */
-  if (phase != TOUCH_ENDED && id == h->throttle_touch) h->throttle_v = pedal_travel(throttle, y);
-  if (phase != TOUCH_ENDED && id == h->brake_touch) h->brake_v = pedal_travel(brake, y);
+  if (phase != TOUCH_ENDED && phase != TOUCH_CANCELLED && id == h->throttle_touch) h->throttle_v = pedal_travel(throttle, y);
+  if (phase != TOUCH_ENDED && phase != TOUCH_CANCELLED && id == h->brake_touch) h->brake_v = pedal_travel(brake, y);
   if (phase != TOUCH_BEGAN && phase != TOUCH_MOVED) {
     if (id == h->left_touch) h->left_touch = 0;
     if (id == h->right_touch) h->right_touch = 0;
@@ -216,7 +261,7 @@ void hud_touch(hud_state *h, void *id, int phase, float x, float y) {
   }
 }
 
-void hud_input(hud_state *h, car_input *in) {
+void hud_input_dt(hud_state *h, car_input *in, float dt) {
   /* digital steering, car_update ramping the wheel towards it; or the iPad's turn past the
    * dead zone, full lock at h->full */
   in->steer = (h->right_touch ? 1.0f : 0.0f) - (h->left_touch ? 1.0f : 0.0f);
@@ -226,9 +271,11 @@ void hud_input(hud_state *h, car_input *in) {
     in->steer = h->tilt < 0 ? -s : s;
   }
   if (h->steer_mode == HUD_STEER_WHEEL && !h->steer_touch && h->wheel_turn != 0.0f) {
-    /* let go, the wheel turns back to straight (a third of a lock a tenth of a second) */
-    float back = WHEEL_LOCK * 0.05f;
-    h->wheel_turn = fabsf(h->wheel_turn) <= back ? 0.0f : h->wheel_turn - (h->wheel_turn > 0 ? back : -back);
+    /* let go, the wheel turns back to straight: a full lock in a third of a second (the
+     * time capped at a tenth of one, a bad value, a stalled frame's or none, no progress) */
+    float elapsed = !isfinite(dt) || dt <= 0 ? 0.0f : fminf(dt, 0.1f);
+    float back = WHEEL_LOCK * (elapsed * 3.0f);
+    h->wheel_turn = fabsf(h->wheel_turn) <= back + WHEEL_LOCK * 1e-6f ? 0.0f : h->wheel_turn - copysignf(back, h->wheel_turn);
     h->steer_v = h->wheel_turn / WHEEL_LOCK;
   }
   if (h->steer_mode == HUD_STEER_WHEEL || h->steer_mode == HUD_STEER_STICK) in->steer = h->steer_v;
@@ -239,6 +286,8 @@ void hud_input(hud_state *h, car_input *in) {
   in->shift_down = h->shift_down > 0;
   h->shift_up = h->shift_down = 0;
 }
+
+void hud_input(hud_state *h, car_input *in) { hud_input_dt(h, in, 1.0f / 60.0f); }
 
 /* ---- drawing ---- */
 
@@ -522,13 +571,16 @@ void hud_set_card(int title, const short *name) {
 }
 
 /* glyphs of base (cells of `cell` px, drawn `out` px) from x, y (the HUD's points): their
- * advances half or full (in out's px), each glyph half if its character is ASCII */
+ * advances half or full (in out's px), each glyph half if its character is ASCII (the meters'
+ * place the player's own, race_meter_glyph: the plate's text goes with it) */
+static void race_meter_glyph(float dst[4]);
 static void plate_glyphs(int base, const unsigned short *g, const unsigned char *half, int n, float x, float y,
                          float cell, float out, float adv_half, float adv_full) {
   const float k = HUD_K / 1.6f; /* the HUD's points over the menus' 640x480 */
   for (int i = 0; i < n; ++i) {
     int s = anm_sprite(base + g[i]);
     float src[4] = { 0, 0, cell, cell }, dst[4] = { x / 1.6f, y / 1.6f, x / 1.6f + out * k, y / 1.6f + out * k };
+    race_meter_glyph(dst);
     if (s >= 0) anm_draw_part(s, src, dst, 1);
     x += (half[i] ? adv_half : adv_full) * HUD_K;
   }
@@ -968,6 +1020,9 @@ void hud_set_city(int city) {
 
 /* The map in its window at (17, 113, 88, 82) of the arcade's GL viewport (y up), looking
  * down from 2000 over the car with its heading up, ortho -2000..2000 x -1200..2800. */
+static void race_map_rect(float *x, float *y, float *w, float *h);
+static void race_rank_anm(float *x, float *y, float *zoom);
+static void race_time_anm(float *x, float *y, float *zoom);
 static void draw_navi(const hud_state *h, const car_race *r) {
   if (!NAVI.n) return;
   if (NAVI.next != r->next_area) { /* clMiniMap::update */
@@ -980,11 +1035,24 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   glGetIntegerv(GL_VIEWPORT, vp);
   float sx = (float)vp[2] / (h->screen_w + 2 * EDGE), sy = (float)vp[3] / h->screen_h;
   float x0 = tx(17), y0 = ty(285) - MAP_UP, w = 88 * HUD_K, hh = 82 * HUD_K;
-  GLint wx = vp[0] + (GLint)((x0 + EDGE) * sx + 0.5f), wy = vp[1] + (GLint)((h->screen_h - y0 - hh) * sy + 0.5f);
-  GLsizei ww = (GLsizei)(w * sx + 0.5f), wh = (GLsizei)(hh * sy + 0.5f);
-  glViewport(wx, wy, ww, wh);
+  race_map_rect(&x0, &y0, &w, &hh); /* the player's own size and place (KEY LAYOUT's HUD page) */
+  /* The map's window in the framebuffer, cut to the framebuffer's own viewport: moved or grown
+   * past the screen's edge, a viewport out of it (negative or bigger than the screen) is not
+   * given to GL (Vulkan will not take one); the projection below is made up for the cut, so the
+   * map is not squeezed but cropped. */
+  if (vp[2] <= 0 || vp[3] <= 0 || h->screen_h <= 0 || h->screen_w + 2 * EDGE <= 0) return;
+  double wx = (double)vp[0] + floor((double)(x0 + EDGE) * sx + 0.5);
+  double wy = (double)vp[1] + floor((double)(h->screen_h - y0 - hh) * sy + 0.5);
+  double ww = floor((double)w * sx + 0.5), wh = floor((double)hh * sy + 0.5);
+  if (!isfinite(wx) || !isfinite(wy) || !isfinite(ww) || !isfinite(wh) || ww <= 0 || wh <= 0) return;
+  double vx0 = fmax(wx, vp[0]), vy0 = fmax(wy, vp[1]);
+  double vx1 = fmin(wx + ww, (double)vp[0] + vp[2]), vy1 = fmin(wy + wh, (double)vp[1] + vp[3]);
+  if (vx1 <= vx0 || vy1 <= vy0) return; /* wholly off the screen */
+  GLint cx = (GLint)vx0, cy = (GLint)vy0;
+  GLsizei cw = (GLsizei)(vx1 - vx0), ch = (GLsizei)(vy1 - vy0);
+  glViewport(cx, cy, cw, ch);
   glEnable(GL_SCISSOR_TEST);
-  glScissor(wx, wy, ww, wh);
+  glScissor(cx, cy, cw, ch);
   glDepthMask(GL_TRUE);
   glClear(GL_DEPTH_BUFFER_BIT);
   glEnable(GL_DEPTH_TEST);
@@ -994,6 +1062,14 @@ static void draw_navi(const hud_state *h, const car_race *r) {
   float fx = -sinf(r->map_angle), fz = -cosf(r->map_angle);
   const float eye[3] = { r->map_x, 2000, r->map_z }, at[3] = { r->map_x, 0, r->map_z }, up[3] = { fx, 0, fz };
   mat4 mvp = mat4_mul(mat4_ortho(-2000, 2000, -1200, 2800, 5, 10000), mat4_look_at(eye, at, up));
+  if (vx0 != wx || vy0 != wy || vx1 != wx + ww || vy1 != wy + wh) { /* cropped: the whole window's view in the cut */
+    mat4 crop = mat4_identity();
+    crop.m[0] = (float)(ww / (vx1 - vx0));
+    crop.m[5] = (float)(wh / (vy1 - vy0));
+    crop.m[12] = (float)((2 * (wx - vx0) + ww) / (vx1 - vx0) - 1);
+    crop.m[13] = (float)((2 * (wy - vy0) + wh) / (vy1 - vy0) - 1);
+    mvp = mat4_mul(crop, mvp);
+  }
   glUseProgram(NAVI.prog);
   glUniformMatrix4fv(NAVI.u_mvp, 1, GL_FALSE, mvp.m);
   glUniform1i(NAVI.u_tex, 0);
@@ -1148,9 +1224,10 @@ static void draw_info_box(int cpu, float x, int face, int name, int car_img, flo
   snprintf(text, sizeof text, "%d     ", m);
   for (int i = 0; i < 5; ++i)
     sw[n++] = (anm_swap){ anm_sprite(T_CPU_DIGIT0 + i), text[i] == ' ' ? -1 : uv(UV_CPU_DIGIT0 + text[i] - '0') };
-  const float zoom = HUD_K / 1.6f;
-  anm_draw_xf(cpu, neg ? 5 - digits : 4 + digits, 1, (1024 + EDGE - (640 - x) * HUD_K) / 1.6f, (TA_Y + 76 * HUD_K) / 1.6f,
-              zoom, sw, n);
+  /* (in the rank's box under the place: it goes with the rank where that is moved or scaled) */
+  float cx = (1024 + EDGE - (640 - x) * HUD_K) / 1.6f, cy = (TA_Y + 76 * HUD_K) / 1.6f, zoom = HUD_K / 1.6f;
+  race_rank_anm(&cx, &cy, &zoom);
+  anm_draw_xf(cpu, neg ? 5 - digits : 4 + digits, 1, cx, cy, zoom, sw, n);
 }
 
 static void draw_rival_info(const car_state *car, int round) {
@@ -1245,7 +1322,9 @@ static void draw_vs_place(const car_race *r) {
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_DOT), uv(UV_PLACE_DOT) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_M), uv(UV_PLACE_M) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE_KM), uv(UV_PLACE_KM) };
-  anm_draw_xf(anim, frame, 1, TA_X / 1.6f, TA_Y / 1.6f, HUD_K / 1.6f, sw, n);
+  float dx = TA_X / 1.6f, dy = TA_Y / 1.6f, zoom = HUD_K / 1.6f;
+  race_rank_anm(&dx, &dy, &zoom);
+  anm_draw_xf(anim, frame, 1, dx, dy, zoom, sw, n);
 }
 
 /* a font's glyphs centred (datrums 9) on a template of a frame drawn at (dx, dy) * zoom: cells
@@ -1952,7 +2031,7 @@ static void draw_ten(const car_state *car) {
   const car_race *r = &car->race;
   if (ten_level < 0 || men < 0 || split < 0 || r->state != CAR_RACE_RUN) return;
   if (!ten_disp) return;
-  const float zoom = HUD_K / 1.6f, dx = TA_X / 1.6f, dy = TA_Y / 1.6f;
+  float zoom = HUD_K / 1.6f, dx = TA_X / 1.6f, dy = TA_Y / 1.6f; /* (race_time_anm moves them) */
   int extend = ten_level >= 10, max = extend ? 31 : 9;
   int round = r->ten_beaten < 0 ? 0 : r->ten_beaten > max ? max : r->ten_beaten;
   if (round != ten_round) {
@@ -1979,8 +2058,11 @@ static void draw_ten(const car_state *car) {
   }
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE4), uv(UV_PLACE0 + (shown % 10 == 0 ? 9 : shown % 10 - 1)) };
   sw[n++] = (anm_swap){ anm_sprite(T_PLACE3), uv(UV_PLACE0 + (shown / 10 % 10 == 0 ? 9 : shown / 10 % 10 - 1)) };
-  anm_draw_xf(men, shown <= 9 ? 4 : 9, 1, dx, dy, zoom, sw, n);
+  float rank_x = dx, rank_y = dy, rank_zoom = zoom;
+  race_rank_anm(&rank_x, &rank_y, &rank_zoom);
+  anm_draw_xf(men, shown <= 9 ? 4 : 9, 1, rank_x, rank_y, rank_zoom, sw, n);
   /* cons_g_splittime: rows 0..3, the last four of the rivals so far */
+  race_time_anm(&dx, &dy, &zoom);
   int first = ten_round > 3 ? ten_round - 3 : 0;
   for (int k = first; k <= ten_round; ++k) { /* getInfoTenClearTime: the one on the road's runs */
     anm_swap ts[8];
@@ -1989,23 +2071,257 @@ static void draw_ten(const car_state *car) {
   draw_rival_info(car, ten_round);
 }
 
+/* ---- the race's consoles the player's own (the KEY LAYOUT's HUD page, hud.h HUD_RACE_*): each
+ * of the map, the rank, the time column and the meters is the console's own drawing under one
+ * affine of the HUD's screen about a pivot of its own (its corner), k times its size and moved
+ * (dx, dy). The texture projection, the animations' coordinates and the map's viewport each take
+ * that same affine. Left at 1 and 0 the drawing is the console's as it was. ---- */
+static float race_k[HUD_RACE_GROUPS] = { 1, 1, 1, 1 }, race_dx[HUD_RACE_GROUPS], race_dy[HUD_RACE_GROUPS];
+
+/* the meters' box: the plate (its speed digits, class, card text and tune) and every needle and
+ * dial of this car's cluster (a turned one by the circle it sweeps). Fallbacks keep it usable
+ * before hud.bin and the meters are loaded, for the editor. */
+static rect race_meter_bounds(void) {
+  float pw = SPR[SPR_PLATE].w > 0 ? SPR[SPR_PLATE].w : 200;
+  float ph = fmaxf(SPR[SPR_PLATE].h, 64);
+  float left = 1024 + EDGE - pw * HUD_K, top = INFO_Y;
+  float right = left + fmaxf(pw, 190) * HUD_K, bottom = top + ph * HUD_K;
+  if (meter_car) {
+    int night = meter_night;
+    int count = meter_car->n[night];
+    if (count > METERDB_MAX_PARTS) count = METERDB_MAX_PARTS;
+    for (int i = 0; i < count; ++i) {
+      const meterdb_part *p = &meter_car->parts[night][i];
+      const hud_sprite *sp = &METER[i];
+      if (!sp->tex) continue;
+      float cx = CLUSTER_X + (p->x - 560) * HUD_K, cy = CLUSTER_Y + (p->y - 228) * HUD_K;
+      float hw = sp->w * HUD_K * 0.5f, hh = sp->h * HUD_K * 0.5f, ex, ey;
+      if (p->a1 != 0) {
+        ex = ey = hypotf(hw, hh); /* a needle: any angle */
+      } else {
+        float a = p->a0 * (float)M_PI / 180.0f, c = fabsf(cosf(a)), s = fabsf(sinf(a));
+        ex = hw * c + hh * s;
+        ey = hw * s + hh * c;
+      }
+      left = fminf(left, cx - ex), right = fmaxf(right, cx + ex);
+      top = fminf(top, cy - ey), bottom = fmaxf(bottom, cy + ey);
+    }
+  } else {
+    left = fminf(left, CLUSTER_X - 175), right = fmaxf(right, CLUSTER_X + 55);
+    top = fminf(top, CLUSTER_Y - 125), bottom = fmaxf(bottom, CLUSTER_Y + 145);
+  }
+  return (rect){ left, top, right - left, bottom - top };
+}
+
+static rect race_bounds(int g) {
+  switch (g) {
+  case HUD_RACE_MAP: {
+    /* the road's window with the frame and either the course's or the story road's name; the
+     * sprites' sizes differ between the data packs */
+    float left = tx(15), top = ty(262) - MAP_UP;
+    float right = tx(17 + 88), bottom = ty(285 + 82) - MAP_UP;
+    int ids[] = { SPR_MAP_WAKU, SPR_MAP_NAME, SPR_MAP_TEXT };
+    int counts[] = { 1, CAR_COURSES, 19 };
+    for (int j = 0; j < 3; ++j)
+      for (int i = 0; i < counts[j]; ++i) {
+        const hud_sprite *sp = &SPR[ids[j] + i];
+        if (!sp->tex) continue;
+        right = fmaxf(right, tx(15) + sp->w * HUD_K);
+        bottom = fmaxf(bottom, ty(j ? 266 : 262) - MAP_UP + sp->h * HUD_K);
+      }
+    return (rect){ left, top, right - left, bottom - top };
+  }
+  case HUD_RACE_RANK: return (rect){ TA_X, TA_Y, 205, 90 };
+  case HUD_RACE_TIME: {
+    float top = fminf(ty(85), ty(364) - MAP_UP), bottom = fmaxf(ty(225), ty(390) - MAP_UP);
+    return (rect){ TA_X - 31, top, 175, bottom - top };
+  }
+  default: return race_meter_bounds();
+  }
+}
+
+void hud_race_layout_set(int g, float k, float dx, float dy) {
+  if (g < 0 || g >= HUD_RACE_GROUPS || !isfinite(k) || !isfinite(dx) || !isfinite(dy)) return;
+  race_k[g] = fmaxf(HUD_KEY_K_MIN, fminf(HUD_KEY_K_MAX, k));
+  race_dx[g] = dx;
+  race_dy[g] = dy;
+}
+
+/* each console's pivot: its own, not tied to the car or the sprites loaded, so a saved layout does
+ * not jump when the race's data replaces the editor's stand-ins */
+static void race_pivot(int g, float *x, float *y) {
+  if (g == HUD_RACE_METER) *x = CLUSTER_X, *y = CLUSTER_Y;
+  else if (g == HUD_RACE_MAP) *x = tx(60), *y = ty(315) - MAP_UP;
+  else *x = TA_X, *y = TA_Y;
+}
+
+static rect race_place_rect(int g, rect r, float k, float dx, float dy) {
+  float x, y;
+  race_pivot(g, &x, &y);
+  return (rect){ x + (r.x - x) * k + dx, y + (r.y - y) * k + dy, r.w * k, r.h * k };
+}
+
+static rect race_placed(int g, float k, float dx, float dy) { return race_place_rect(g, race_bounds(g), k, dx, dy); }
+
+/* the time column is two places, the times up the right and the seconds left under the map */
+static rect race_time_region(int region) {
+  if (region == 0) return (rect){ TA_X - 31, ty(85), 175, ty(225) - ty(85) };
+  return (rect){ TA_X - 31, ty(364) - MAP_UP, 175, ty(390) - ty(364) };
+}
+
+int hud_race_layout_hit(float x, float y) {
+  /* the time column's box also spans the gap the map is in: the map first where they overlap, then
+   * the time's two real places in their own coordinates. The editor's PREV and NEXT still reach
+   * a console another one covers. */
+  if (inside(race_placed(HUD_RACE_MAP, race_k[HUD_RACE_MAP], race_dx[HUD_RACE_MAP], race_dy[HUD_RACE_MAP]), x, y))
+    return HUD_RACE_MAP;
+  for (int g = HUD_RACE_GROUPS - 1; g >= 0; --g) {
+    if (g == HUD_RACE_MAP) continue;
+    if (g == HUD_RACE_TIME) {
+      float px, py;
+      race_pivot(g, &px, &py);
+      float lx = px + (x - px - race_dx[g]) / race_k[g], ly = py + (y - py - race_dy[g]) / race_k[g];
+      if (inside(race_time_region(0), lx, ly) || inside(race_time_region(1), lx, ly)) return g;
+    } else if (inside(race_placed(g, race_k[g], race_dx[g], race_dy[g]), x, y)) {
+      return g;
+    }
+  }
+  return -1;
+}
+
+float hud_race_layout_max_scale(int g) {
+  if (g < 0 || g >= HUD_RACE_GROUPS) return 1.0f;
+  rect r = race_bounds(g);
+  if (!(r.w > 0 && r.h > 0)) return 1.0f;
+  return fmaxf(HUD_KEY_K_MIN, fminf(HUD_KEY_K_MAX, fminf((1024 + 2 * EDGE) / r.w, 768 / r.h)));
+}
+
+/* the box the clamp keeps on the screen: a console's own less what hangs over the screen's edge as it
+ * comes (the time column's margin on the left), so that a console as it comes is never moved by
+ * the clamp, a nudge or a size key leaving it where it was */
+static rect race_clamp_box(int g) {
+  rect r = race_bounds(g);
+  float x0 = fmaxf(r.x, -EDGE), y0 = fmaxf(r.y, 0), x1 = fminf(r.x + r.w, 1024 + EDGE), y1 = fminf(r.y + r.h, 768);
+  return x1 > x0 && y1 > y0 ? (rect){ x0, y0, x1 - x0, y1 - y0 } : r;
+}
+
+void hud_race_layout_clamp(int g, float k, float *dx, float *dy) {
+  if (g < 0 || g >= HUD_RACE_GROUPS || !dx || !dy || !isfinite(k) || !isfinite(*dx) || !isfinite(*dy)) return;
+  k = fmaxf(HUD_KEY_K_MIN, fminf(HUD_KEY_K_MAX, k));
+  rect r = race_place_rect(g, race_clamp_box(g), k, 0, 0);
+  /* one too big for the screen (an old value) is centred on that axis, not held to an edge */
+  *dx = r.w > 1024 + 2 * EDGE ? 512 - r.x - r.w / 2 : fmaxf(-EDGE - r.x, fminf(1024 + EDGE - r.x - r.w, *dx));
+  *dy = r.h > 768 ? 384 - r.y - r.h / 2 : fmaxf(-r.y, fminf(768 - r.y - r.h, *dy));
+}
+
+void hud_draw_race_layout(float w, float h, int sel) {
+  hud_ui_begin(w, h);
+  for (int g = 0; g < HUD_RACE_GROUPS; ++g)
+    for (int region = 0; region < (g == HUD_RACE_TIME ? 2 : 1); ++region) {
+      rect r = g == HUD_RACE_TIME ? race_place_rect(g, race_time_region(region), race_k[g], race_dx[g], race_dy[g])
+                                  : race_placed(g, race_k[g], race_dx[g], race_dy[g]);
+      hud_ui_rect(r.x, r.y, r.w, r.h, 0.08f, 0.12f, 0.18f, 0.5f);
+      float cr = g == sel ? 1.0f : 0.7f, cg = g == sel ? 0.5f : 0.8f;
+      hud_ui_rect(r.x, r.y, r.w, 2, cr, cg, 0.3f, 1);
+      hud_ui_rect(r.x, r.y + r.h - 2, r.w, 2, cr, cg, 0.3f, 1);
+      hud_ui_rect(r.x, r.y, 2, r.h, cr, cg, 0.3f, 1);
+      hud_ui_rect(r.x + r.w - 2, r.y, 2, r.h, cr, cg, 0.3f, 1);
+      static const char *label[] = { "MAP", "RANK", "TIME", "METER" };
+      hud_ui_text(label[g], r.x + 5, r.y + 5, 2, 1, 1, 1, 1);
+    }
+  hud_ui_end();
+}
+
+/* the map's window (the HUD's points) under its affine */
+static void race_map_rect(float *x, float *y, float *w, float *h) {
+  float k = race_k[HUD_RACE_MAP], px, py;
+  if (k == 1 && race_dx[HUD_RACE_MAP] == 0 && race_dy[HUD_RACE_MAP] == 0) return;
+  race_pivot(HUD_RACE_MAP, &px, &py);
+  *x = px + (*x - px) * k + race_dx[HUD_RACE_MAP];
+  *y = py + (*y - py) * k + race_dy[HUD_RACE_MAP];
+  *w *= k, *h *= k;
+}
+
+/* a glyph's destination (menu px, the HUD's points over 1.6) under the meters' affine */
+static void race_meter_glyph(float dst[4]) {
+  int g = HUD_RACE_METER;
+  float k = race_k[g], x, y;
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return;
+  race_pivot(g, &x, &y);
+  for (int i = 0; i < 4; i += 2) {
+    dst[i] = (x + (dst[i] * 1.6f - x) * k + race_dx[g]) / 1.6f;
+    dst[i + 1] = (y + (dst[i + 1] * 1.6f - y) * k + race_dy[g]) / 1.6f;
+  }
+}
+
+/* an animation's place and zoom (menu px) under a console's affine */
+static void race_anm(int g, float *x, float *y, float *zoom) {
+  float k = race_k[g], px, py;
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return;
+  race_pivot(g, &px, &py);
+  *x = (px + (*x * 1.6f - px) * k + race_dx[g]) / 1.6f;
+  *y = (py + (*y * 1.6f - py) * k + race_dy[g]) / 1.6f;
+  *zoom *= k;
+}
+static void race_rank_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_RANK, x, y, zoom); }
+static void race_time_anm(float *x, float *y, float *zoom) { race_anm(HUD_RACE_TIME, x, y, zoom); }
+
+/* the textured drawing under a console's affine (the texture program's projection): begin, draw,
+ * end; the original comes back at the end */
+typedef struct {
+  int active;
+  mat4 original;
+} race_view;
+
+static race_view race_view_begin(int g, const hud_state *h) {
+  race_view s = { 0, screen_ortho(h->screen_w, h->screen_h) };
+  float k = race_k[g];
+  if (k == 1 && race_dx[g] == 0 && race_dy[g] == 0) return s;
+  float x, y;
+  race_pivot(g, &x, &y);
+  mat4 affine = mat4_identity();
+  affine.m[0] = affine.m[5] = k;
+  affine.m[12] = (1 - k) * x + race_dx[g];
+  affine.m[13] = (1 - k) * y + race_dy[g];
+  mat4 p = mat4_mul(s.original, affine);
+  glUseProgram(tex_prog);
+  glUniformMatrix4fv(u_tproj, 1, GL_FALSE, p.m);
+  s.active = 1;
+  return s;
+}
+
+static void race_view_end(race_view s) {
+  if (!s.active) return;
+  glUseProgram(tex_prog);
+  glUniformMatrix4fv(u_tproj, 1, GL_FALSE, s.original.m);
+}
+
 static void draw_ta(const hud_state *h, const car_state *car, const mat4 *proj) {
   const car_race *r = &car->race;
   if (!SPR[SPR_TILL_GOAL].tex) return;
   glEnableVertexAttribArray(1);
   if (ten_level < 0 && !vs_n) {
+    race_view v = race_view_begin(HUD_RACE_RANK, h);
     draw_till_goal(r->remain);
+    race_view_end(v);
+    v = race_view_begin(HUD_RACE_TIME, h);
     draw_times(r);
+    race_view_end(v);
   }
+  race_view map = race_view_begin(HUD_RACE_MAP, h);
   map_blit(SPR_MAP_WAKU, 15, 262);
   draw_navi(h, r);
   glUseProgram(tex_prog);
   glUniformMatrix4fv(u_tproj, 1, GL_FALSE, proj->m);
+  if (map.active) (void)race_view_begin(HUD_RACE_MAP, h); /* (draw_navi's own program took the projection back) */
   glEnableVertexAttribArray(1);
   /* the black box over the map: the course's name, in a story race the road's (S2DInfoMap +0x14) */
   if (!ta_story && ta_course >= 0 && ta_course < CAR_COURSES) map_blit(SPR_MAP_NAME + ta_course, 15, 266);
   if (ta_story && r->map_text >= 1 && r->map_text <= 19) map_blit(SPR_MAP_TEXT + r->map_text - 1, 15, 266);
-  draw_time_left(r->time_left);
+  race_view_end(map);
+  race_view time = race_view_begin(HUD_RACE_TIME, h);
+  draw_time_left(r->time_left); /* the seconds left, under the map, with the time column */
+  race_view_end(time);
   if (!ta_story && ten_level < 0) draw_records();
   draw_sign(r);
   if (r->state == CAR_RACE_RUN) draw_time_extend(r->total);
@@ -2331,11 +2647,15 @@ void hud_draw(const hud_state *h, const car_state *car, const car_input *in, flo
     glActiveTexture(GL_TEXTURE0);
   }
   if (tex_prog && consoles) {
+    race_view meter = race_view_begin(HUD_RACE_METER, h);
     draw_meters(car);
-    draw_shifter(car);
+    race_view_end(meter);
+    draw_shifter(car); /* (the gear's own, not the meters' cluster) */
+    meter = race_view_begin(HUD_RACE_METER, h);
     draw_plate(car);
+    race_view_end(meter);
     draw_ta(h, car, &proj);
-    draw_plate_text();
+    draw_plate_text(); /* its glyphs take the meters' affine themselves: race_meter_glyph */
   }
   /* the AT/MT switch (a touch key of the port, not a console: shown while the 10-in-a-row
    * hides the consoles too) shows the gearbox in use with the shifter's own tag */
@@ -2681,32 +3001,49 @@ void hud_layout_set(int group, float k, float dx, float dy) {
   USER_DX[group] = dx, USER_DY[group] = dy;
 }
 
-int hud_layout_hit(int gyro, float x, float y) {
+/* a group's box by the steering (HUD_STEER_*): the left group's is the wheel's circle (with its
+ * touch's reach) or the stick's zone where those are the steering, the keys' bar otherwise */
+static rect group_rect_mode(int group, int mode) {
+  if (group == HUD_EDIT_SHIFT) return shift_rect(mode == HUD_STEER_GYRO);
+  if (group == KEY_LEFT && mode == HUD_STEER_WHEEL) return (rect){ WHEEL_CX - 128, WHEEL_CY - 128, 256, 256 };
+  if (group == KEY_LEFT && mode == HUD_STEER_STICK)
+    return (rect){ STICK_ZONE.x, STICK_ZONE.y - 14, STICK_ZONE.w, STICK_ZONE.h + 14 };
+  return group_rect(group, mode == HUD_STEER_GYRO);
+}
+
+int hud_layout_hit_mode(int mode, float x, float y) {
   /* the shift keys first: they are the right group's own part until they leave it */
-  rect s = shift_key(shift_rect(gyro));
+  rect s = shift_key(group_rect_mode(HUD_EDIT_SHIFT, mode));
   if (x >= s.x - 10 && x <= s.x + s.w + 10 && y >= s.y - 10 && y <= s.y + s.h + 10) return HUD_EDIT_SHIFT;
   for (int g = 0; g < HUD_KEY_GROUPS; ++g) {
-    rect r = key(group_rect(g, gyro), g);
+    rect r = key(group_rect_mode(g, mode), g);
     if (x >= r.x - 10 && x <= r.x + r.w + 10 && y >= r.y - 10 && y <= r.y + r.h + 10) return g;
   }
   return -1;
 }
 
-void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
+int hud_layout_hit(int gyro, float x, float y) {
+  return hud_layout_hit_mode(gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, x, y);
+}
+
+void hud_layout_clamp_mode(int group, int mode, float k, float *dx, float *dy) {
   if (group < 0 || group >= HUD_EDIT_GROUPS) return;
   k = k < HUD_KEY_K_MIN ? HUD_KEY_K_MIN : k > HUD_KEY_K_MAX ? HUD_KEY_K_MAX : k;
-  rect r = group == HUD_EDIT_SHIFT ? place(shift_rect(gyro), KEY_RIGHT, k, *dx, *dy) : place(group_rect(group, gyro), group, k, *dx, *dy);
+  rect r = place(group_rect_mode(group, mode), group == HUD_EDIT_SHIFT ? KEY_RIGHT : group, k, *dx, *dy);
   if (r.x + r.w > 1024 + EDGE) *dx -= r.x + r.w - (1024 + EDGE);
   if (r.x < -EDGE) *dx += -EDGE - r.x;
   if (r.y + r.h > 768) *dy -= r.y + r.h - 768;
   if (r.y < 0) *dy -= r.y;
 }
 
-void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
+void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy) {
+  hud_layout_clamp_mode(group, gyro ? HUD_STEER_GYRO : HUD_STEER_KEYS, k, dx, dy);
+}
+
+void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel) {
   hud_state h;
   hud_init(&h, screen_w, screen_h);
-  h.steer_mode = gyro; /* (the OPTION's steering: HUD_STEER_*) */
-  h.gyro = gyro == HUD_STEER_GYRO;
+  hud_set_steer_mode(&h, mode); /* (the OPTION's steering: HUD_STEER_*) */
   glUseProgram(prog);
   mat4 proj = screen_ortho(screen_w, screen_h);
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
@@ -2723,13 +3060,18 @@ void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
   glUniformMatrix4fv(u_proj, 1, GL_FALSE, proj.m);
   /* each group's box, the chosen one's orange */
   for (int g = 0; g < HUD_EDIT_GROUPS; ++g) {
-    rect r = g == HUD_EDIT_SHIFT ? shift_key(shift_rect(h.gyro)) : key(group_rect(g, h.gyro), g);
+    rect r = g == HUD_EDIT_SHIFT ? shift_key(group_rect_mode(g, mode)) : key(group_rect_mode(g, mode), g);
     r = (rect){ r.x - 6, r.y - 6, r.w + 12, r.h + 12 };
     if (g == sel) color(1.0f, 0.42f, 0.05f, 0.95f);
     else color(1, 1, 1, 0.35f);
     frame_rect(r, g == sel ? 4 : 2);
   }
   glDisable(GL_BLEND);
+}
+
+/* (its steering parameter has always been the OPTION's, HUD_STEER_*, though named gyro) */
+void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel) {
+  hud_draw_layout_mode(screen_w, screen_h, gyro, sel);
 }
 
 void hud_wide(float edge, float key_k) {

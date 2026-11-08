@@ -905,6 +905,23 @@ static int options_load(void) {
   /* the story's last time of day (menu.h story_zone), a fifth line: 0 morning, 1 night */
   int sz = 0;
   if (n >= 3 && fscanf(f, " story %d", &sz) == 1) G.menu.story_zone = sz == 1;
+  /* the stick's dead zone (percent, 0..50) and centre (0 floating, 1 fixed), a sixth line (menu.h stick_*) */
+  int st[2];
+  if (n >= 3 && fscanf(f, " stick %d %d", &st[0], &st[1]) == 2) {
+    G.menu.stick_dead = st[0] < 0 || st[0] > 50 ? 8 : st[0];
+    G.menu.stick_fixed = st[1] == 1;
+  }
+  /* the HUD page's four consoles (menu.h hud_*, hud.h HUD_RACE_*: map, rank, time, meters): each size
+   * percent and move, a seventh line */
+  int hd[12];
+  if (n >= 3 && fscanf(f, " hud %d %d %d %d %d %d %d %d %d %d %d %d", &hd[0], &hd[1], &hd[2], &hd[3], &hd[4], &hd[5], &hd[6],
+                       &hd[7], &hd[8], &hd[9], &hd[10], &hd[11]) == 12)
+    for (int g = 0; g < 4; ++g) {
+      int k = hd[g * 3], dx = hd[g * 3 + 1], dy = hd[g * 3 + 2];
+      G.menu.hud_k[g] = k < 60 ? 60 : k > 160 ? 160 : k;
+      G.menu.hud_dx[g] = dx < -2000 || dx > 2000 ? 0 : dx;
+      G.menu.hud_dy[g] = dy < -2000 || dy > 2000 ? 0 : dy;
+    }
   fclose(f);
   if (n < 3) return 0;
   G.menu.hires = hires != 0;
@@ -921,8 +938,8 @@ static int options_load(void) {
 }
 
 static void options_save(void) {
-  static int last[30] = { -1 };
-  int now[30] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
+  static int last[44] = { -1 };
+  int now[44] = { G.menu.gyro, G.menu.gyro_sens, G.menu.over_on, G.menu.sharp_on, G.menu.pedal_slide, G.menu.ao_on,
                   G.menu.bm_on, G.menu.hd_tex, G.menu.bloom_on, G.menu.ssao_on, G.menu.wet_on, G.menu.paint_on,
                   G.menu.aa4, G.menu.hires };
   for (int g = 0; g < 3; ++g)
@@ -931,6 +948,9 @@ static void options_save(void) {
   now[24] = G.menu.ta_traffic;
   now[25] = G.menu.key_shift_sep, now[26] = G.menu.key_shift_k, now[27] = G.menu.key_shift_dx, now[28] = G.menu.key_shift_dy;
   now[29] = G.menu.story_zone;
+  now[30] = G.menu.stick_dead, now[31] = G.menu.stick_fixed;
+  for (int g = 0; g < 4; ++g)
+    now[32 + g * 3] = G.menu.hud_k[g], now[33 + g * 3] = G.menu.hud_dx[g], now[34 + g * 3] = G.menu.hud_dy[g];
   if (G.options_global && !memcmp(now, last, sizeof now)) return;
   char path[1100];
   snprintf(path, sizeof path, "%s/option", G.save_dir);
@@ -944,6 +964,9 @@ static void options_save(void) {
   fprintf(f, "traffic %d\n", now[24]);
   fprintf(f, "shift %d %d %d %d\n", now[25], now[26], now[27], now[28]);
   fprintf(f, "story %d\n", now[29]);
+  fprintf(f, "stick %d %d\n", now[30], now[31]);
+  fprintf(f, "hud %d %d %d %d %d %d %d %d %d %d %d %d\n", now[32], now[33], now[34], now[35], now[36], now[37], now[38], now[39],
+          now[40], now[41], now[42], now[43]);
   fclose(f);
   memcpy(last, now, sizeof last);
   G.options_global = 1;
@@ -1466,10 +1489,10 @@ int app_wants_tilt(void) { return G.menu.gyro == HUD_STEER_GYRO; }
 /* the OPTION screen's steering for the race's keys: the tilt for a full lock, 50 degrees at
  * sensitivity 1 down to 15 at 10 */
 static void hud_options(void) {
-  /* (menu.gyro holds the steering: keys, tilt, wheel or stick) */
-  if (G.hud.steer_mode != G.menu.gyro) G.hud.steer_touch = 0, G.hud.steer_v = G.hud.wheel_turn = 0;
-  G.hud.steer_mode = G.menu.gyro;
-  G.hud.gyro = G.menu.gyro == HUD_STEER_GYRO;
+  /* (menu.gyro holds the steering: keys, tilt, wheel or stick; a change lets go of the fingers on the controls) */
+  hud_set_steer_mode(&G.hud, G.menu.gyro);
+  hud_set_stick_center_mode(&G.hud, G.menu.stick_fixed ? HUD_STICK_FIXED : HUD_STICK_FLOAT);
+  hud_set_stick_deadzone_percent(G.menu.stick_dead);
   G.hud.slide = G.menu.pedal_slide;
   G.hud.tilt = G.tilt;
   G.hud.full = (50.0f - (float)(G.menu.gyro_sens - 1) * (35.0f / 9.0f)) * 0.0174533f;
@@ -1478,6 +1501,9 @@ static void hud_options(void) {
     hud_layout_set(g, (float)G.menu.key_k[g] * 0.01f, (float)G.menu.key_dx[g], (float)G.menu.key_dy[g]);
   hud_shift_layout_set(G.menu.key_shift_sep, (float)G.menu.key_shift_k * 0.01f, (float)G.menu.key_shift_dx,
                        (float)G.menu.key_shift_dy);
+  /* and its HUD page's: the map, rank, time and meters */
+  for (int g = 0; g < HUD_RACE_GROUPS; ++g)
+    hud_race_layout_set(g, (float)G.menu.hud_k[g] * 0.01f, (float)G.menu.hud_dx[g], (float)G.menu.hud_dy[g]);
 }
 
 void app_press_start(void) {

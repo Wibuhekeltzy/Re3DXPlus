@@ -5,7 +5,9 @@
 
 #include "car.h"
 
-enum { TOUCH_BEGAN, TOUCH_MOVED, TOUCH_ENDED };
+/* TOUCH_CANCELLED: the system took the finger (a call, a gesture, the app sent away); it lets go
+ * of what it held like TOUCH_ENDED, but without a press of its own (the Java side sends it as 3) */
+enum { TOUCH_BEGAN, TOUCH_MOVED, TOUCH_ENDED, TOUCH_CANCELLED };
 
 typedef struct {
   void *left_touch, *right_touch; /* steering buttons */
@@ -26,6 +28,9 @@ typedef struct {
    * steer_touch the finger on them, steer_v the steer it gives, the wheel's turn so far and
    * the finger's last angle, the stick's base and knob (layout px of the left keys) */
   int steer_mode;
+  /* the stick's centre (the KEY LAYOUT's CENTER key): HUD_STICK_FLOAT where the thumb goes down,
+   * HUD_STICK_FIXED always at the wheel's place (a touch near it takes it) */
+  int stick_center_mode;
   void *steer_touch;
   float steer_v, wheel_turn, wheel_last, stick_x0, stick_y0, stick_x, stick_y;
   /* the OPTION screen's slider pedals: a pedal's travel is the finger's height on its key
@@ -35,7 +40,15 @@ typedef struct {
 } hud_state;
 
 enum { HUD_STEER_KEYS, HUD_STEER_GYRO, HUD_STEER_WHEEL, HUD_STEER_STICK, HUD_STEER_MODES };
+enum { HUD_STICK_FLOAT, HUD_STICK_FIXED };
 void hud_init(hud_state *h, float screen_w, float screen_h);
+/* Call when the steering changes (gyro included): the fingers on the controls are let go, so no
+ * key stays held. */
+void hud_set_steer_mode(hud_state *h, int mode);
+/* The stick's centre, HUD_STICK_*; a change lets go of the finger on it. */
+void hud_set_stick_center_mode(hud_state *h, int mode);
+/* The stick's dead zone about its centre, percent of its reach (0..50, 8 the default). */
+void hud_set_stick_deadzone_percent(int percent);
 /* A screen wider than 4:3 (an iPhone's 3:2): edge layout px more on each side of the
  * 1024x768 layout (0 on the iPad); the consoles move out to the sides, the race's touch keys
  * too, key_k times their size. */
@@ -55,7 +68,10 @@ void hud_set_class(int cls);
 void hud_set_card(int title, const short *name);
 /* `id` identifies a finger (the UITouch pointer on iOS). */
 void hud_touch(hud_state *h, void *id, int phase, float x, float y);
-/* Fill the car input from the controls; edge-triggered buttons are consumed. */
+/* Fill the car input from the controls; edge-triggered buttons are consumed. hud_input is one
+ * 1/60 s tick of hud_input_dt, whose dt (seconds, at most 0.1, a bad value does not advance)
+ * times the wheel's turn back to straight when let go: a full lock back in a third of a second. */
+void hud_input_dt(hud_state *h, car_input *in, float dt);
 void hud_input(hud_state *h, car_input *in);
 
 int hud_gl_init(void);
@@ -154,6 +170,27 @@ int hud_layout_hit(int gyro, float x, float y);
 void hud_layout_clamp(int group, int gyro, float k, float *dx, float *dy);
 /* the editor's view: the race's keys as hud_layout_set has them, group sel (-1 none) outlined */
 void hud_draw_layout(float screen_w, float screen_h, int gyro, int sel);
+/* The same by the steering (HUD_STEER_*, not just the gyro's yes/no): the left group's box is
+ * the wheel's circle or the stick's zone when those are the steering. */
+int hud_layout_hit_mode(int mode, float x, float y);
+void hud_layout_clamp_mode(int group, int mode, float k, float *dx, float *dy);
+void hud_draw_layout_mode(float screen_w, float screen_h, int mode, int sel);
+
+/* The race's consoles, the KEY LAYOUT editor's second page (Allan 1.31): the minimap with its
+ * frame and name, the rank, the time column (with the seconds left under the map) and the meters
+ * with their plate, each scaled by k about its own corner of the screen (HUD_KEY_K_MIN..MAX, 1
+ * the default) and moved (dx, dy layout px). Their sizes and places are this layout's: the
+ * HUD's drawing code takes them as an affine over the console's own. */
+enum { HUD_RACE_MAP, HUD_RACE_RANK, HUD_RACE_TIME, HUD_RACE_METER, HUD_RACE_GROUPS };
+void hud_race_layout_set(int group, float k, float dx, float dy);
+/* the console at (x, y), -1 none */
+int hud_race_layout_hit(float x, float y);
+/* the largest k that still fits the screen (at most 1.6, at least 0.6) */
+float hud_race_layout_max_scale(int group);
+/* (dx, dy) brought back so the console, k times its size, stays on the screen */
+void hud_race_layout_clamp(int group, float k, float *dx, float *dy);
+/* the editor's view of them: each console's box, group sel (-1 none) outlined */
+void hud_draw_race_layout(float screen_w, float screen_h, int sel);
 
 /* The menus' left/right keys and back button, in the same style: which one is at (x, y)
  * (-1, +1, HUD_MENU_BACK, or 0), and drawing them (held = the one being pressed, or 0;

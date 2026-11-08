@@ -36,7 +36,9 @@ static int tid;
 static void fresh(menu_state *m) {
   memset(m, 0, sizeof *m);
   for (int g = 0; g < 3; ++g) m->key_k[g] = 100;
+  for (int g = 0; g < HUD_RACE_GROUPS; ++g) m->hud_k[g] = 100;
   m->key_shift_k = 100;
+  m->stick_dead = LAY_STICK_DEAD;
   layout_enter(m);
 }
 
@@ -87,19 +89,22 @@ int main(void) {
     tap_button(m, LAY_SMALLER);
     CHECK(m->key_shift_k == 90 && m->key_k[HUD_KEYS_RIGHT] == 100);
 
-    /* the panel's last key puts them back with the right keys, and splits them off again from where the right keys are */
-    tap_button(m, LAY_SHIFT);
+    /* RESET GROUP puts them back with the right keys, and sizing splits them off again from where the right keys are */
+    tap_button(m, LAY_RESET);
     CHECK(m->key_shift_sep == 0 && m->lay_sel == HUD_EDIT_SHIFT);
+    CHECK(m->key_shift_k == 100 && m->key_shift_dx == 0 && m->key_shift_dy == 0);
     CHECK(hud_layout_hit(gyro, sx, sy) == HUD_EDIT_SHIFT);
     m->key_k[HUD_KEYS_RIGHT] = 120, m->key_dx[HUD_KEYS_RIGHT] = -30, m->key_dy[HUD_KEYS_RIGHT] = -20;
-    tap_button(m, LAY_SHIFT);
+    tap_button(m, LAY_BIGGER);
     CHECK(m->key_shift_sep == 1);
-    CHECK(m->key_shift_k == 120 && m->key_shift_dx == -30 && m->key_shift_dy == -20);
+    CHECK(m->key_shift_k == 130 && m->key_shift_dx == -30 && m->key_shift_dy == -20);
+    CHECK(m->key_k[HUD_KEYS_RIGHT] == 120); /* (the right keys stay) */
 
-    /* sized while still with the right keys: split off, starting from the right keys' size */
-    tap_button(m, LAY_RESET);
+    /* RESET KEYS puts every key group back, the shift keys with the right keys */
+    tap_button(m, LAY_RESET_ALL);
     CHECK(m->key_shift_sep == 0 && m->key_shift_k == 100 && m->key_shift_dx == 0 && m->key_shift_dy == 0);
-    CHECK(m->key_k[HUD_KEYS_RIGHT] == 100 && m->key_dx[HUD_KEYS_RIGHT] == 0);
+    CHECK(m->key_k[HUD_KEYS_RIGHT] == 100 && m->key_dx[HUD_KEYS_RIGHT] == 0 && m->key_dy[HUD_KEYS_RIGHT] == 0);
+    /* sized while still with the right keys: split off, starting from the right keys' size */
     m->key_k[HUD_KEYS_RIGHT] = 130;
     m->lay_sel = HUD_EDIT_SHIFT;
     tap_button(m, LAY_SMALLER);
@@ -112,7 +117,7 @@ int main(void) {
     CHECK(m->key_shift_k == (int)(HUD_KEY_K_MIN * 100 + 0.5f));
 
     /* dragged off every edge, they stay on the screen at their size */
-    tap_button(m, LAY_RESET);
+    tap_button(m, LAY_RESET_ALL);
     m->lay_sel = HUD_EDIT_SHIFT;
     tap_button(m, LAY_BIGGER);
     tap_button(m, LAY_BIGGER);
@@ -129,10 +134,11 @@ int main(void) {
     }
 
     /* split off in place, nothing has moved; moved away, nothing is left where they were */
-    tap_button(m, LAY_RESET);
+    tap_button(m, LAY_RESET_ALL);
     CHECK(hud_layout_hit(gyro, sx, sy) == HUD_EDIT_SHIFT);
-    tap_button(m, LAY_SHIFT);
-    CHECK(m->key_shift_sep == 1 && hud_layout_hit(gyro, sx, sy) == HUD_EDIT_SHIFT);
+    tap_button(m, LAY_BIGGER);
+    tap_button(m, LAY_SMALLER); /* split off at the size they had: nothing has moved */
+    CHECK(m->key_shift_sep == 1 && m->key_shift_k == 100 && hud_layout_hit(gyro, sx, sy) == HUD_EDIT_SHIFT);
     m->key_shift_dx = -300, m->key_shift_dy = -300;
     layout_apply(m);
     CHECK(hud_layout_hit(gyro, sx, sy) == -1);

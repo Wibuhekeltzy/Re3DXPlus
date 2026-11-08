@@ -194,14 +194,23 @@ typedef struct {
   int card_color_was;
   /* The OPTION screen's KEY LAYOUT (MENU_LAYOUT, Allan 10-29): the race's touch keys by group
    * (hud.h HUD_KEYS_*) their size (percent, 60..160) and move (layout px), kept with the
-   * options; the editor's chosen group, the finger dragging it (lay_drag) from where (lay_x, y
-   * less the group's move), and a button of its panel tapped (lay_tap, 1 + LAY_*) */
+   * options (the editor's own state is below) */
   int key_k[3], key_dx[3], key_dy[3];
   /* the shift keys' own (hud.h HUD_EDIT_SHIFT, the fourth group): once key_shift_sep they have
    * their own size, move and place (key_shift_k, _dx, _dy), else they follow the right keys;
    * kept with the options; lay_shift_sep_was the one before a finger took them */
   int key_shift_sep, key_shift_k, key_shift_dx, key_shift_dy, lay_shift_sep_was;
-  int lay_sel, lay_drag, lay_tap;
+  /* the editor's second page (lay_page 1, Allan 1.31): the race's four consoles (hud.h
+   * HUD_RACE_*: map, rank, time, meters), each's size (percent) and move, kept with the options;
+   * and the stick's dead zone (percent of its reach, 8 the default) and centre (0 floating, 1
+   * fixed at the wheel's place) */
+  int hud_k[4], hud_dx[4], hud_dy[4];
+  int stick_dead, stick_fixed, lay_page;
+  /* the editor's touch: its chosen group (lay_sel of the page's groups), the finger down (lay_touch)
+   * on a panel button (lay_button_down, 1 + LAY_*) or dragging a group (lay_drag) by how far it has
+   * come from where it started (lay_x, y; the group's move then, lay_old_dx, dy), and a button of
+   * the panel tapped (lay_tap, 1 + LAY_*) */
+  int lay_sel, lay_drag, lay_tap, lay_button_down, lay_old_dx, lay_old_dy;
   void *lay_touch;
   float lay_x, lay_y;
   /* The dress-up menu the game mode select's wheel key opens (MENU_TG_SELECT, the arcade's
