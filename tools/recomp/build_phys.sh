@@ -8,4 +8,9 @@ set -e
 cd "$(dirname "$0")"
 export WMMT_MAIN="${1:-../../../Wangan Midnight Maximum Tune 3DX+ (Japan)/main}"
 python3 recomp.py ../../src/phys/phys_rc.c $(cat roots.txt)
+# the one unbounded walk the original code has (CAreaProcessorJunction::MoveToPrev reads
+# area_array[-1] at section 0: a crash seen on a phone): clamped in the generated file, see
+# guard_sections.py. Idempotent, and best effort: where it finds the code other than it expects it
+# says so and the build goes on without it.
+python3 guard_sections.py ../../src/phys/phys_rc.c || echo "guard_sections: not applied, the physics is as the original code is"
 python3 mkimage.py ../../data/phys.img

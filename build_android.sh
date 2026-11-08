@@ -38,6 +38,11 @@ else
 fi
 
 # the native library: the game as on iOS, with main_android.c for main.m and sound_ios.m
+# (the physics first gets its one lower bound, tools/recomp/guard_sections.py: idempotent, and best
+# effort, as in build_phys.sh; a physics file that was generated before it is guarded here)
+if [ -f src/phys/phys_rc.c ] && [ -f tools/recomp/guard_sections.py ]; then
+  python3 tools/recomp/guard_sections.py src/phys/phys_rc.c || echo "guard_sections: not applied, the physics is as the original code is"
+fi
 if [ ! -f "$OUT/obj/phys_rc.o" ] || [ src/phys/phys_rc.c -nt "$OUT/obj/phys_rc.o" ]; then
   echo "compiling the arcade physics (takes a minute)..."
   $CC -O2 -fPIC -ffp-contract=off -DRC_FPT=double -w -c src/phys/phys_rc.c -o "$OUT/obj/phys_rc.o"
