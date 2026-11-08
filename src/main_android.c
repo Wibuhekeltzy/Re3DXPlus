@@ -13,8 +13,10 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,7 @@
 #include "app.h"
 #include "gl.h"
 #include "sound.h"
+#include "timing60.h"
 
 /* the attract movies (prepare_movie.sh), indexed as app_movie() returns them */
 static const char *const MOVIES[3] = { "intro.mp4", "playdemo.mp4", "tutorial.mp4" };
@@ -36,13 +39,15 @@ static struct {
   JavaVM *vm;
   jobject activity;
   jmethodID show_movie, play_bgm, bgm_level, fail;
+  _Atomic unsigned activity_generation; /* up with each MainActivity that takes the game over */
+  unsigned synced_generation;           /* (the game thread's) the one the movie and BGM were last told to */
   char data_dir[512], save_dir[512];
   pthread_mutex_t mx;
   pthread_cond_t cv;
   ANativeWindow *window; /* the surface to draw on (NULL while there is none) */
   int window_changed, paused, started;
   touch_ev touches[TOUCH_MAX];
-  int n_touch;
+  int n_touch, touch_desync;
   int press_start, movie_done_ev, memory_warning;
   float tilt;
   int tilt_new, wants_tilt;
@@ -60,7 +65,102 @@ static struct {
   int movie; /* shown, -1 none */
   const char *bgm;
   AAudioStream *audio;
-} A = { .movie = -1 };
+} A = { .movie = -1, .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+/* ---- touches: the failsafe ----
+ * The UI thread queues them (under A.mx), the game thread takes them once a frame. A queue that
+ * overflows, or that the lifecycle (a pause, a lost surface) throws away, is "poisoned" rather than
+ * silently short: the game thread then lets go of every finger it knows (a phase 3, cancelled, for
+ * each, so that no pedal, key or drag stays held), and from then on ignores a finger it has not seen
+ * go down since, so that an old finger cannot come back with a stray move or lift.
+ * The queue is touched under A.mx only; the list of fingers down is the game thread's own. */
+static void touch_enqueue(touch_ev ev) {
+  if (A.touch_desync) return;
+  if (A.n_touch == TOUCH_MAX) {
+    A.n_touch = 0;
+    A.touch_desync = 1;
+    return;
+  }
+  A.touches[A.n_touch++] = ev;
+}
+
+/* Under A.mx: the queue's events, and whether it was poisoned (the events then are none). */
+static int touch_take(touch_ev *out, int *desync) {
+  int n = A.n_touch;
+  memcpy(out, A.touches, (size_t)n * sizeof *out);
+  *desync = A.touch_desync;
+  A.n_touch = A.touch_desync = 0;
+  return n;
+}
+
+typedef struct touch_active {
+  int id;
+  float x, y;
+  struct touch_active *next;
+} touch_active;
+static touch_active *touch_active_head;
+static int touch_strict;
+
+static void touch_cancel_all(void) {
+  while (touch_active_head) {
+    touch_active *p = touch_active_head;
+    touch_active_head = p->next;
+    app_touch((void *)((intptr_t)p->id + 1), 3, p->x * A.touch_k - A.touch_edge, p->y * A.touch_k);
+    free(p);
+  }
+  touch_strict = 1;
+}
+
+/* A poison after the snapshot was taken throws the rest of it away too. Short on purpose: input can
+ * arrive again as soon as it returns. */
+static void touch_reconcile_snapshot(int *n, int *desync) {
+  pthread_mutex_lock(&A.mx);
+  if (A.touch_desync) {
+    A.n_touch = 0;
+    A.touch_desync = 0;
+    *n = 0;
+    *desync = 1;
+  }
+  pthread_mutex_unlock(&A.mx);
+}
+
+static void touch_deliver(touch_ev *events, int n, int desync) {
+  if (desync) touch_cancel_all();
+  for (int i = 0; i < n; ++i) {
+    int remaining = n - i, poisoned = 0;
+    touch_reconcile_snapshot(&remaining, &poisoned);
+    if (poisoned) {
+      touch_cancel_all();
+      return;
+    }
+    touch_ev e = events[i];
+    touch_active **link = &touch_active_head;
+    while (*link && (*link)->id != e.id) link = &(*link)->next;
+    touch_active *p = *link;
+    if (e.phase == 0 && !p) {
+      p = malloc(sizeof *p);
+      if (!p) {
+        /* no memory to follow it: throw everything away, poisoned, and let go of what is down */
+        pthread_mutex_lock(&A.mx);
+        A.n_touch = 0;
+        A.touch_desync = 1;
+        pthread_mutex_unlock(&A.mx);
+        touch_cancel_all();
+        return;
+      }
+      *p = (touch_active){ e.id, e.x, e.y, NULL };
+      *link = p;
+    } else if (touch_strict && !p) {
+      continue;
+    }
+    if (p) p->x = e.x, p->y = e.y;
+    app_touch((void *)((intptr_t)e.id + 1), e.phase, e.x * A.touch_k - A.touch_edge, e.y * A.touch_k);
+    if (p && (e.phase == 2 || e.phase == 3)) {
+      *link = p->next;
+      free(p);
+    }
+  }
+}
 
 static double now_s(void) {
   struct timespec t;
@@ -68,43 +168,133 @@ static double now_s(void) {
   return (double)t.tv_sec + t.tv_nsec * 1e-9;
 }
 
-/* ---- sound: sound.c's mix, 44.1 kHz stereo int16, low latency ---- */
+/* ---- sound: sound.c's mix, 44.1 kHz stereo int16, low latency ----
+ * The audio callback only mixes, and says when an error came; the game thread owns the stream's
+ * life: it opens it, restarts it on return from a pause, and when the output goes away (a
+ * headphone jack, a Bluetooth speaker off) or a start fails, opens a new one, up to three tries
+ * five seconds apart (sound.h snd_retry). The tries are given back after ten seconds of a stream
+ * that kept running. */
+
+static _Atomic unsigned audio_disconnect_generation;
+static _Atomic int audio_other_error;
+static unsigned audio_generation, audio_handled_generation;
+static snd_retry audio_retry;
 
 static aaudio_data_callback_result_t audio_cb(AAudioStream *s, void *user, void *data, int32_t frames) {
   snd_mix((short *)data, frames);
   return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-static void audio_error(AAudioStream *s, void *user, aaudio_result_t err);
+/* Callback thread: a disconnect is written down by the number of the stream it came from, a number
+ * only ever raised, so a late call from an old stream cannot take back a newer stream's. */
+static void audio_note_disconnect(unsigned generation) {
+  unsigned old = atomic_load_explicit(&audio_disconnect_generation, memory_order_relaxed);
+  while (old < generation &&
+         !atomic_compare_exchange_weak_explicit(&audio_disconnect_generation, &old, generation, memory_order_relaxed,
+                                                memory_order_relaxed)) {
+  }
+}
 
-static void audio_open(void) {
-  AAudioStreamBuilder *b;
-  if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return;
+static void audio_error(AAudioStream *s, void *user, aaudio_result_t err) {
+  unsigned generation = (unsigned)(uintptr_t)user;
+  if (err == AAUDIO_ERROR_DISCONNECTED) audio_note_disconnect(generation);
+  else atomic_store_explicit(&audio_other_error, err, memory_order_relaxed);
+}
+
+static void audio_close(void) {
+  if (A.audio) {
+    AAudioStream_close(A.audio);
+    A.audio = NULL;
+  }
+}
+
+static int audio_start(void) {
+  aaudio_result_t r = AAudioStream_requestStart(A.audio);
+  fprintf(stderr, "audio: start %d state %d\n", r, AAudioStream_getState(A.audio));
+  return r == AAUDIO_OK;
+}
+
+static int audio_open(void) {
+  AAudioStreamBuilder *b = NULL;
+  if (audio_generation == UINT32_MAX) {
+    fprintf(stderr, "audio: streams used up\n");
+    return 0;
+  }
+  ++audio_generation;
+  aaudio_result_t r = AAudio_createStreamBuilder(&b);
+  if (r != AAUDIO_OK) {
+    fprintf(stderr, "audio: no stream builder (%d)\n", r);
+    return 0;
+  }
   AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
   AAudioStreamBuilder_setChannelCount(b, 2);
   AAudioStreamBuilder_setSampleRate(b, SND_RATE);
   AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
   AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
   AAudioStreamBuilder_setDataCallback(b, audio_cb, NULL);
-  AAudioStreamBuilder_setErrorCallback(b, audio_error, NULL);
-  if (AAudioStreamBuilder_openStream(b, &A.audio) == AAUDIO_OK) AAudioStream_requestStart(A.audio);
-  else A.audio = NULL;
+  /* (a number, not a pointer: it is never dereferenced) */
+  AAudioStreamBuilder_setErrorCallback(b, audio_error, (void *)(uintptr_t)audio_generation);
+  r = AAudioStreamBuilder_openStream(b, &A.audio);
   AAudioStreamBuilder_delete(b);
+  if (r != AAUDIO_OK) {
+    A.audio = NULL;
+    fprintf(stderr, "audio: open failed (%d)\n", r);
+    return 0;
+  }
+  int format = AAudioStream_getFormat(A.audio), channels = AAudioStream_getChannelCount(A.audio);
+  int rate = AAudioStream_getSampleRate(A.audio);
+  fprintf(stderr, "audio: open format %d rate %d channels %d state %d\n", format, rate, channels,
+          AAudioStream_getState(A.audio));
+  /* snd_mix writes stereo int16 at SND_RATE: never start a stream that is not that */
+  if (format != AAUDIO_FORMAT_PCM_I16 || channels != 2 || rate != SND_RATE) {
+    fprintf(stderr, "audio: not the stream asked for, not started\n");
+    audio_close();
+    return 0;
+  }
+  if (!audio_start()) {
+    audio_close();
+    return 0;
+  }
+  return 1;
 }
 
-/* the output went away (headphones in or out): a new stream, from a thread of its own as
- * AAudio asks */
-static void *audio_reopen(void *arg) {
-  if (A.audio) AAudioStream_close(A.audio);
-  A.audio = NULL;
-  audio_open();
-  return NULL;
-}
-
-static void audio_error(AAudioStream *s, void *user, aaudio_result_t err) {
-  if (err != AAUDIO_ERROR_DISCONNECTED) return;
-  pthread_t t;
-  if (pthread_create(&t, NULL, audio_reopen, NULL) == 0) pthread_detach(t);
+/* The game thread, once a frame while the game is up (resume: the first after a pause). */
+static void audio_service(int resume, double now) {
+  int err = atomic_exchange_explicit(&audio_other_error, 0, memory_order_relaxed);
+  if (err) fprintf(stderr, "audio: stream error %d\n", err);
+  int interrupted = 0;
+  unsigned disconnected = atomic_load_explicit(&audio_disconnect_generation, memory_order_relaxed);
+  if (A.audio && disconnected == audio_generation && disconnected != audio_handled_generation) {
+    audio_handled_generation = disconnected;
+    fprintf(stderr, "audio: disconnected (stream %u)\n", disconnected);
+    audio_close();
+    now = now_s();
+    interrupted = 1;
+    snd_retry_interrupt(&audio_retry, now);
+    if (!audio_retry.pending) fprintf(stderr, "audio: given up after 3 tries\n");
+  }
+  if (resume && A.audio) {
+    int state = AAudioStream_getState(A.audio);
+    if (state != AAUDIO_STREAM_STATE_STARTED && !audio_start()) {
+      audio_close();
+      now = now_s();
+      interrupted = 1;
+      snd_retry_interrupt(&audio_retry, now);
+      if (!audio_retry.pending) fprintf(stderr, "audio: given up after 3 tries\n");
+    }
+  }
+  /* back from a pause with no stream and the tries spent: a fresh set (after the wait, if the
+   * stream has only just gone) */
+  if (resume && !A.audio && !audio_retry.pending && audio_retry.attempts >= 3)
+    snd_retry_begin(&audio_retry, now + (interrupted ? 5.0 : 0.0));
+  if (snd_retry_due(&audio_retry, now, 0)) {
+    int ok = audio_open();
+    now = now_s();
+    snd_retry_result(&audio_retry, now, ok);
+    if (!ok && !audio_retry.pending) fprintf(stderr, "audio: given up after 3 tries\n");
+  }
+  /* a stream that has stayed started ten seconds of play has its tries back */
+  if (A.audio) snd_retry_stability(&audio_retry, now, AAudioStream_getState(A.audio) == AAUDIO_STREAM_STATE_STARTED);
 }
 
 /* ---- calls up to MainActivity (the game thread is attached to the VM) ---- */
@@ -115,15 +305,36 @@ static JNIEnv *env_here(void) {
   return env;
 }
 
+/* The live MainActivity as a local reference (nativeStart swaps it when the activity is remade), or NULL. */
+static jobject activity_ref(JNIEnv *env) {
+  pthread_mutex_lock(&A.mx);
+  jobject activity = (*env)->NewLocalRef(env, A.activity);
+  pthread_mutex_unlock(&A.mx);
+  return activity;
+}
+
 static void call_str(jmethodID m, const char *s) {
   JNIEnv *env = env_here();
   jstring js = s ? (*env)->NewStringUTF(env, s) : NULL;
-  (*env)->CallVoidMethod(env, A.activity, m, js);
+  jobject activity = activity_ref(env);
+  if (activity) {
+    (*env)->CallVoidMethod(env, activity, m, js);
+    (*env)->DeleteLocalRef(env, activity);
+  }
   if (js) (*env)->DeleteLocalRef(env, js);
 }
 
 /* the movie the attract loop wants and the BGM (main.m syncMovie) */
 static void sync_movie(void) {
+  static float level = 1.0f;
+  /* a new MainActivity (the old one was remade) has no movie or BGM playing: tell it all again */
+  unsigned generation = atomic_load(&A.activity_generation);
+  if (generation != A.synced_generation) {
+    A.synced_generation = generation;
+    A.movie = -2;
+    A.bgm = NULL;
+    level = 1.0f;
+  }
   int want = app_movie();
   if (want != A.movie) {
     A.movie = want;
@@ -135,12 +346,15 @@ static void sync_movie(void) {
     call_str(A.play_bgm, track);
   }
   /* (the story ending's fade out) */
-  static float level = 1.0f;
   float l = app_bgm_level();
   if (l != level) {
     level = l;
     JNIEnv *env = env_here();
-    (*env)->CallVoidMethod(env, A.activity, A.bgm_level, (jfloat)l);
+    jobject activity = activity_ref(env);
+    if (activity) {
+      (*env)->CallVoidMethod(env, activity, A.bgm_level, (jfloat)l);
+      (*env)->DeleteLocalRef(env, activity);
+    }
   }
 }
 
@@ -262,11 +476,17 @@ static int start_game(void) {
     call_str(A.fail, app_error());
     return -1;
   }
-  audio_open();
+  snd_retry_begin(&audio_retry, now_s()); /* (audio_service opens the stream with the first frame) */
   pthread_t t;
   if (A.load_ctx != EGL_NO_CONTEXT && pthread_create(&t, NULL, loader, NULL) == 0) pthread_detach(t);
   else fprintf(stderr, "no loading thread: the menu frames load\n");
   return 0;
+}
+
+static int64_t now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
 static void *game(void *arg) {
@@ -276,34 +496,63 @@ static void *game(void *arg) {
     return NULL;
   }
   double last = 0;
+  timing60_pacer pacer = { 0 };
   int failed = 0, away = 0;
   for (;;) {
+    /* a frame about every 1/60 s whatever the display's rate: sleep to the next absolute deadline
+     * (timing60.h; the race's steps are counted from the time between frames in app.c) */
+    int64_t deadline = timing60_deadline(&pacer, now_ns());
+    struct timespec ts = { (time_t)(deadline / 1000000000LL), (long)(deadline % 1000000000LL) };
+    int slept;
+    do slept = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+    while (slept == EINTR);
+    if (slept) { /* (no sleep to be had: the frames go unpaced, as the iOS build's) */
+      static int told;
+      if (!told++) fprintf(stderr, "clock_nanosleep: %d, frames unpaced\n", slept);
+      timing60_pacer_reset(&pacer);
+    }
     touch_ev tv[TOUCH_MAX];
-    int nt, press, done, warn, tilt_new;
+    int nt, touch_desync, press, done, warn, tilt_new;
     float tilt;
     pthread_mutex_lock(&A.mx);
     while (A.paused || (!A.window && !A.window_changed)) {
       if (A.started && !away && !failed) {
+        /* the lifecycle poisoned the touch queue: let go of every finger here, on the game thread,
+         * even if no frame or surface ever comes again */
+        pthread_mutex_unlock(&A.mx);
+        touch_cancel_all();
+        pthread_mutex_lock(&A.mx);
         app_suspend(1); /* the loading thread stops too */
 #ifdef WMMT_VK
         vkgl_pipeline_cache_save();
 #endif
-        if (A.audio) AAudioStream_requestPause(A.audio);
+        snd_retry_stability(&audio_retry, now_s(), 0);
+        if (A.audio) {
+          aaudio_result_t paused = AAudioStream_requestPause(A.audio);
+          fprintf(stderr, "audio: pause %d state %d\n", paused, AAudioStream_getState(A.audio));
+        }
         away = 1;
       }
       last = 0;
-      pthread_cond_wait(&A.cv, &A.mx);
+      timing60_pacer_reset(&pacer);
+      /* (the lock was open a moment above: look again before waiting for a change) */
+      if (A.paused || (!A.window && !A.window_changed)) pthread_cond_wait(&A.cv, &A.mx);
     }
     if (A.window_changed) take_window();
-    nt = A.n_touch;
-    memcpy(tv, A.touches, nt * sizeof *tv);
-    A.n_touch = 0;
+    /* the queued touches wait while there is no surface; a queue poisoned meanwhile is let go of below */
+    nt = 0, touch_desync = 0;
+    if (SURFACE_UP) nt = touch_take(tv, &touch_desync);
     press = A.press_start, done = A.movie_done_ev, warn = A.memory_warning;
     A.press_start = A.movie_done_ev = A.memory_warning = 0;
     tilt = A.tilt, tilt_new = A.tilt_new;
     A.tilt_new = 0;
     pthread_mutex_unlock(&A.mx);
-    if (!SURFACE_UP) continue;
+    if (!SURFACE_UP) {
+      snd_retry_stability(&audio_retry, now_s(), 0);
+      last = 0;
+      timing60_pacer_reset(&pacer);
+      continue;
+    }
     if (!A.started) {
       A.started = 1;
       failed = start_game() != 0;
@@ -312,9 +561,9 @@ static void *game(void *arg) {
       usleep(100000);
       continue;
     }
+    audio_service(away, now_s());
     if (away) {
       app_suspend(0);
-      if (A.audio) AAudioStream_requestStart(A.audio);
       away = 0;
     }
     if (warn) app_memory_warning();
@@ -323,14 +572,20 @@ static void *game(void *arg) {
       app_movie_done();
     }
     if (press) app_press_start();
-    for (int i = 0; i < nt; ++i)
-      app_touch((void *)(intptr_t)(tv[i].id + 1), tv[i].phase, tv[i].x * A.touch_k - A.touch_edge, tv[i].y * A.touch_k);
+    touch_reconcile_snapshot(&nt, &touch_desync);
+    touch_deliver(tv, nt, touch_desync);
     A.wants_tilt = app_wants_tilt();
     if (tilt_new) app_tilt(tilt);
     double now = now_s();
-    float dt = last > 0 ? (float)(now - last) : 1.0f / 30.0f;
+    timing60_started(&pacer, now_ns());
+    /* (no time has gone by on the first frame, or the one after a pause) */
+    float dt = last > 0 ? (float)(now - last) : 0.0f;
     last = now;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    /* a touch queue poisoned since: let go of the fingers before this frame uses them */
+    int none = 0, poisoned = 0;
+    touch_reconcile_snapshot(&none, &poisoned);
+    if (poisoned) touch_cancel_all();
     app_frame(dt);
     sync_movie();
     /* depth and stencil need not go out to memory */
@@ -359,9 +614,23 @@ static void *game(void *arg) {
 #define JFN(name) Java_com_wmmt_port_MainActivity_##name
 
 JNIEXPORT void JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject activity, jstring data, jstring save) {
-  if (A.activity) return; /* a second onCreate (the activity remade): the game goes on */
+  pthread_mutex_lock(&A.mx);
+  if (A.activity) {
+    /* a second onCreate (the activity remade): the game goes on, its movie and BGM now to the new
+     * activity (the game thread tells it, by the generation) */
+    jobject replacement = (*env)->NewGlobalRef(env, activity);
+    if (replacement) {
+      (*env)->DeleteGlobalRef(env, A.activity);
+      A.activity = replacement;
+      atomic_fetch_add(&A.activity_generation, 1);
+    }
+    pthread_mutex_unlock(&A.mx);
+    return;
+  }
   (*env)->GetJavaVM(env, &A.vm);
   A.activity = (*env)->NewGlobalRef(env, activity);
+  atomic_fetch_add(&A.activity_generation, 1);
+  pthread_mutex_unlock(&A.mx);
   A.show_movie = (*env)->GetMethodID(env, cls, "showMovie", "(Ljava/lang/String;)V");
   A.play_bgm = (*env)->GetMethodID(env, cls, "playBgm", "(Ljava/lang/String;)V");
   A.bgm_level = (*env)->GetMethodID(env, cls, "bgmLevel", "(F)V");
@@ -376,8 +645,6 @@ JNIEXPORT void JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject activit
   freopen(log, "w", stderr);
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "start (android)\n");
-  pthread_mutex_init(&A.mx, NULL);
-  pthread_cond_init(&A.cv, NULL);
   pthread_t t;
   pthread_attr_t at;
   pthread_attr_init(&at);
@@ -389,6 +656,7 @@ JNIEXPORT void JNICALL JFN(nativeStart)(JNIEnv *env, jclass cls, jobject activit
 JNIEXPORT void JNICALL JFN(nativeSurface)(JNIEnv *env, jclass cls, jobject surface, jint w, jint h) {
   ANativeWindow *win = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
   pthread_mutex_lock(&A.mx);
+  if (!surface) A.n_touch = 0, A.touch_desync = 1; /* the surface is going: the fingers on it are let go of */
   if (A.window) ANativeWindow_release(A.window);
   A.window = win;
   A.window_changed = 1;
@@ -408,12 +676,13 @@ JNIEXPORT void JNICALL JFN(nativeSurface)(JNIEnv *env, jclass cls, jobject surfa
 
 JNIEXPORT void JNICALL JFN(nativeTouch)(JNIEnv *env, jclass cls, jint id, jint phase, jfloat x, jfloat y) {
   pthread_mutex_lock(&A.mx);
-  if (A.n_touch < TOUCH_MAX) A.touches[A.n_touch++] = (touch_ev){ id, phase, x, y };
+  touch_enqueue((touch_ev){ id, phase, x, y });
   pthread_mutex_unlock(&A.mx);
 }
 
 JNIEXPORT void JNICALL JFN(nativePause)(JNIEnv *env, jclass cls, jboolean p) {
   pthread_mutex_lock(&A.mx);
+  if (p) A.n_touch = 0, A.touch_desync = 1; /* paused: the fingers are let go of */
   A.paused = p;
   pthread_cond_broadcast(&A.cv);
   pthread_mutex_unlock(&A.mx);

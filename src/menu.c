@@ -5470,6 +5470,16 @@ void menu_movie_done(menu_state *m) {
 }
 
 void menu_touch(menu_state *m, void *id, int phase, float x, float y) {
+  if (phase == TOUCH_CANCELLED) {
+    /* the system took the finger: nothing it held is pressed, and nothing is tapped or gone back to
+     * (the layout editor lets go of its own, below, and the pause menu and the result take no
+     * holds) */
+    if (m->screen == MENU_LAYOUT) layout_touch(m, id, phase, x, y);
+    if (id && id == m->back_touch) m->back_touch = 0;
+    m->vs.held = 0, m->test_hold = 0;
+    if (!m->back_touch) m->key_held = 0;
+    return;
+  }
   if (m->finish) {
     if (phase == TOUCH_BEGAN) m->tap = 1; /* anywhere: leaves the result */
     return;

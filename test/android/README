@@ -1,0 +1,3 @@
+Declaration-only stand-ins for the Android NDK headers src/main_android.c includes (EGL, Vulkan,
+AAudio, the native window, the GLES2 ones over test/glstub.h), so that the file can be built on a
+desktop for its host tests (test/touch_failsafe_test.c). jni.h is the JDK's. Nothing here is run.

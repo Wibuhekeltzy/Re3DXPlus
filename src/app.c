@@ -1330,7 +1330,18 @@ void app_wide(float edge, float key_k) {
   }
 }
 
+#ifdef __ANDROID__
+/* the race's steps from the time between frames, so that a 90, 120 or 144 Hz display does not run the
+ * game fast (timing60.h): the one fraction of a step carried from frame to frame, let go of whenever
+ * the game is not running (menus, pause, the first frames of a race, a pause of the app) */
+#include "timing60.h"
+static timing60_sim android_sim;
+#endif
+
 int app_init(const char *data_dir, int fb_width, int fb_height, float screen_w, float screen_h) {
+#ifdef __ANDROID__
+  timing60_sim_reset(&android_sim);
+#endif
   char path[1100];
   G.fb_w = fb_width;
   G.fb_h = fb_height;
@@ -1477,10 +1488,20 @@ void app_touch(void *id, int phase, float x, float y) {
     if (phase == TOUCH_BEGAN) G.menu.ending_skip |= G.menu.ending_t < MENU_ENDING_SKIP;
     return;
   }
-  if (G.in_menu || G.paused || (G.menu.finish && phase == TOUCH_BEGAN))
+  if (phase == TOUCH_CANCELLED) {
+    /* the system took the finger (a pause, a lost surface, a gesture): nothing it held is pressed or
+     * tapped, in the race's keys or in a menu, whichever it went down on */
+    hud_touch(&G.hud, id, phase, x, y);
     menu_touch(&G.menu, id, phase, x, y);
-  else
+    return;
+  }
+  if (G.in_menu || G.paused || (G.menu.finish && phase == TOUCH_BEGAN)) {
+    /* a finger may have gone down on a key of the race before the menu came up: let go of it */
+    if (phase == TOUCH_ENDED) hud_touch(&G.hud, id, TOUCH_CANCELLED, x, y);
+    menu_touch(&G.menu, id, phase, x, y);
+  } else {
     hud_touch(&G.hud, id, phase, x, y); /* (over the result, letting go of the pedals) */
+  }
 }
 
 void app_tilt(float radians) { G.tilt = radians; }
@@ -2347,6 +2368,9 @@ void app_loader(void) {
 }
 
 void app_suspend(int away) {
+#ifdef __ANDROID__
+  timing60_sim_reset(&android_sim);
+#endif
   pthread_mutex_lock(&G.load_mx);
   G.away = away;
   pthread_mutex_unlock(&G.load_mx);
@@ -4011,6 +4035,9 @@ void app_frame(float dt) {
   }
 #endif
   if (G.in_menu) {
+#ifdef __ANDROID__
+    timing60_sim_reset(&android_sim);
+#endif
     menu_frame(dt, frame_start);
     perf_menu(dt, now_ms() - frame_start);
     return;
@@ -4079,7 +4106,13 @@ void app_frame(float dt) {
     hud_init(&G.hud, G.hud.screen_w, G.hud.screen_h); /* let go of the pedals and the wheel */
     menu_pause_open(&G.menu);
   }
+#ifdef __ANDROID__
+  int android_was_paused = G.paused && !G.vs_race;
+#endif
   if (G.paused) {
+#ifdef __ANDROID__
+    if (!G.vs_race) timing60_sim_reset(&android_sim);
+#endif
     snd_quiet();
     int r = menu_pause_update(&G.menu, dt);
     if (r == MENU_LEAVE) {
@@ -4128,13 +4161,21 @@ void app_frame(float dt) {
     garage_save();
     G.hud.trans_pressed = 0;
   }
-  /* One arcade frame per display frame: dt comes from vsync-aligned timestamps, so
-   * rounding it counts the vsyncs that went by. (An accumulator drifting around 1/60 s now
-   * and then ran no step one frame and two the next, a visible hitch.) */
+  /* iOS: one arcade frame per display frame; dt comes from vsync-aligned timestamps, so rounding
+   * it counts the vsyncs that went by. (An accumulator drifting around 1/60 s now and then ran no
+   * step one frame and two the next, a visible hitch.) Android: the display may run at 60, 90, 120
+   * or 144 Hz, so the steps are counted from the time itself (timing60.h), the frames paced to 1/60 s
+   * by main_android.c to keep that even. */
   double t0 = now_ms();
-  int steps = (int)(dt * 60.0f + 0.5f);
+  int steps;
+#ifdef __ANDROID__
+  /* the first two frames hold the race start and the first draws, not driving time */
+  steps = timing60_race_steps(&android_sim, dt, android_was_paused, G.race_frames < 2);
+#else
+  steps = (int)(dt * 60.0f + 0.5f);
   /* the first frames' dt holds the race start and its first draw, not driving time */
   if (steps < 1 || G.race_frames < 2) steps = 1;
+#endif
   if (G.paused && !G.vs_race) steps = 0; /* a versus runs on with the others under it */
   if (G.period_in > 0) G.period_in -= steps;
   if (movie) { /* clRaceThread::race: the movie's frames, then the race */

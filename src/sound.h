@@ -8,6 +8,27 @@
 
 #define SND_RATE 44100
 
+/* The Android audio stream's retry policy (main_android.c audio_service), a header of its own for the
+ * host test (test/timing60_test.c): up to three tries to open and start it, five seconds apart; a
+ * stream that has stayed started for ten seconds of play has earned its tries back. */
+typedef struct { int attempts, pending, tracking; double next, stable_since; } snd_retry;
+static inline void snd_retry_begin(snd_retry *r, double now) { r->attempts = 0; r->pending = 1; r->next = now; r->tracking = 0; }
+static inline int snd_retry_due(const snd_retry *r, double now, int paused) { return !paused && r->pending && r->attempts < 3 && now >= r->next; }
+static inline void snd_retry_result(snd_retry *r, double now, int ok) {
+  ++r->attempts; r->tracking = 0;
+  r->pending = !ok && r->attempts < 3;
+  r->next = now + 5.0;
+}
+static inline void snd_retry_interrupt(snd_retry *r, double now) {
+  if (!r->attempts) r->attempts = 1;
+  r->tracking = 0; r->pending = r->attempts < 3; r->next = now + 5.0;
+}
+static inline void snd_retry_stability(snd_retry *r, double now, int started) {
+  if (!started) r->tracking = 0;
+  else if (!r->tracking) { r->tracking = 1; r->stable_since = now; }
+  else if (now - r->stable_since >= 10.0) r->attempts = 0;
+}
+
 /* Loads the WAVs in data_dir/sound (every car's engine sounds in sound/engine). Returns 0
  * on success; missing files are silent. */
 int snd_init(const char *data_dir);

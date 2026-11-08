@@ -35,6 +35,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   static native void nativePressStart();
   static native void nativeMemoryWarning();
 
+  /* the activity the native side is bound to (the last one created): the process can outlive
+   * its activity (back from the game, then the icon again: a new MainActivity on the same
+   * running game), and the old one's late callbacks (its surface going, its onDestroy) must not
+   * reach what now belongs to the new one */
+  private static MainActivity current;
+
   private FrameLayout root;
   private SurfaceView game;
   private VideoView movie;
@@ -45,6 +51,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
 
   @Override protected void onCreate(Bundle b) {
     super.onCreate(b);
+    current = this;
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
     if (android.os.Build.VERSION.SDK_INT >= 28)
       getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -78,6 +85,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   }
 
   private void touch(MotionEvent e) {
+    if (current != this) return;
     int a = e.getActionMasked();
     if (a == MotionEvent.ACTION_MOVE) {
       for (int i = 0; i < e.getPointerCount(); ++i) nativeTouch(e.getPointerId(i), 1, e.getX(i), e.getY(i));
@@ -87,7 +95,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
         : a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP ? 2 : a == MotionEvent.ACTION_CANCEL ? 3 : -1;
     if (phase < 0) return;
     if (phase == 3) {
-      for (int i = 0; i < e.getPointerCount(); ++i) nativeTouch(e.getPointerId(i), 2, e.getX(i), e.getY(i));
+      /* the system took the gesture away (a notification pulled down, the palm rejection, a
+       * second window): every finger on it goes down as cancelled, each with its own id and
+       * last place, so the game lets go of what it held without counting it a tap */
+      for (int i = 0; i < e.getPointerCount(); ++i) nativeTouch(e.getPointerId(i), 3, e.getX(i), e.getY(i));
       return;
     }
     int i = e.getActionIndex();
@@ -95,12 +106,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   }
 
   @Override public void surfaceCreated(SurfaceHolder h) {}
-  @Override public void surfaceChanged(SurfaceHolder h, int fmt, int w, int ht) { nativeSurface(h.getSurface(), w, ht); }
-  @Override public void surfaceDestroyed(SurfaceHolder h) { nativeSurface(null, 0, 0); }
+  @Override public void surfaceChanged(SurfaceHolder h, int fmt, int w, int ht) {
+    Surface surface = h.getSurface();
+    /* the game keeps its own 60 Hz time (src/timing60.h); this only asks a 90/120 Hz screen to
+     * show its frames at a steady 60 (a hint: the system may keep the mode it has) */
+    if (android.os.Build.VERSION.SDK_INT >= 30 && surface != null && surface.isValid()) {
+      try { surface.setFrameRate(60.0f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE); }
+      catch (IllegalStateException | IllegalArgumentException ignored) { }
+    }
+    if (current == this) nativeSurface(surface, w, ht);
+  }
+  @Override public void surfaceDestroyed(SurfaceHolder h) { if (current == this) nativeSurface(null, 0, 0); }
 
   @Override protected void onPause() {
     super.onPause();
-    nativePause(true);
+    if (current == this) nativePause(true);
     sensors.unregisterListener(this);
     if (bgm != null) bgm.pause();
     if (movie != null) movie.pause();
@@ -109,22 +129,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   @Override protected void onResume() {
     super.onResume();
     hideBars();
-    nativePause(false);
+    if (current == this) nativePause(false);
     if (gravity != null) sensors.registerListener(this, gravity, SensorManager.SENSOR_DELAY_GAME);
     if (bgm != null) bgm.start();
     if (movie != null) movie.start();
   }
 
+  @Override protected void onDestroy() {
+    if (current == this) current = null;
+    if (bgm != null) {
+      bgm.release();
+      bgm = null;
+    }
+    if (movie != null) {
+      movie.stopPlayback();
+      movie = null;
+    }
+    super.onDestroy();
+  }
+
   @Override public void onTrimMemory(int level) {
     super.onTrimMemory(level);
-    if (level >= TRIM_MEMORY_RUNNING_LOW) nativeMemoryWarning();
+    if (current == this && level >= TRIM_MEMORY_RUNNING_LOW) nativeMemoryWarning();
   }
 
   /* the phone turned like a wheel (main.m's tilt): gravity's angle in the screen's plane from
    * its down, clockwise positive; nothing when it lies flat. In landscape the screen's right is
    * the sensor's -y (rotation 90) or +y (270) and its down the sensor's +x or -x. */
   @Override public void onSensorChanged(SensorEvent e) {
-    if (!nativeWantsTilt()) return;
+    if (current != this || !nativeWantsTilt()) return;
     float gx = e.values[0], gy = e.values[1];
     int rot = getWindowManager().getDefaultDisplay().getRotation();
     float right = rot == Surface.ROTATION_270 ? gy : -gy, down = rot == Surface.ROTATION_270 ? -gx : gx;
@@ -138,6 +171,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   /* the attract movie (data dir's intro.mp4 etc.), or none for null */
   void showMovie(final String name) {
     runOnUiThread(() -> {
+      if (current != this) return;
       if (movie != null) {
         movie.stopPlayback();
         root.removeView(movie);
@@ -177,6 +211,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   /* data dir's sound/bgm/<name>.m4a over and over, or nothing for null */
   void playBgm(final String name) {
     runOnUiThread(() -> {
+      if (current != this) return;
       if (bgm != null) {
         bgm.release();
         bgm = null;
@@ -199,12 +234,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Se
   /* the BGM's level (the story ending's fade out; a new track starts at full) */
   void bgmLevel(final float level) {
     runOnUiThread(() -> {
-      if (bgm != null) bgm.setVolume(level, level);
+      if (current == this && bgm != null) bgm.setVolume(level, level);
     });
   }
 
   void fail(final String msg) {
-    runOnUiThread(() -> new android.app.AlertDialog.Builder(this).setTitle("WMMT3DX").setMessage(msg)
-        .setPositiveButton("OK", null).show());
+    runOnUiThread(() -> {
+      if (current != this || isFinishing()) return;
+      new android.app.AlertDialog.Builder(this).setTitle("WMMT3DX").setMessage(msg)
+          .setPositiveButton("OK", null).show();
+    });
   }
 }

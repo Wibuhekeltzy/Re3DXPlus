@@ -1,0 +1,1 @@
+#define EGL_OPENGL_ES3_BIT_KHR 0x40
