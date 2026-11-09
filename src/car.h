@@ -128,6 +128,7 @@ typedef struct {
   float steer;      /* smoothed steering input */
   float rpm;
   float rev_rate;   /* rpm over the rev limit, 0..1 (CEngine::GetRevRate) */
+  int rev_lamp_frame; /* yt::CSeq::nCnt, the arcade's frame count (read only: the REV lamp's blink phase) */
   float boost;      /* the turbo's boost (CTurbo +4) */
   int gear;         /* 1..5 as the arcade gearbox reports it, 0 = neutral */
   int manual;       /* 0 = automatic (the arcade's AT setting), 1 = manual */

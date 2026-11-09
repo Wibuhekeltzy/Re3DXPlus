@@ -5,6 +5,7 @@ ports/*/compile.*/
 ports/*/src/phys/phys_rc.c
 ports/*/src/vkgl_spv.c
 ports/*/src/racing_lamp_data.h
+/src/racing_lamp_data.h
 ports/*/src/story_cutin_data.h
 ports/*/src/time_texture.h
 ports/*/src/cardb.h

@@ -22,6 +22,9 @@ void glDepthFunc(GLenum); void glCullFace(GLenum); void glFrontFace(GLenum); voi
 void glUniformMatrix4fv(GLint,GLsizei,GLboolean,const GLfloat*); void glVertexAttribPointer(GLuint,GLint,GLenum,GLboolean,GLsizei,const void*);
 void glDrawElements(GLenum,GLsizei,GLenum,const void*); void glDrawArrays(GLenum,GLint,GLsizei); void glViewport(GLint,GLint,GLsizei,GLsizei);
 void glClearColor(GLfloat,GLfloat,GLfloat,GLfloat); void glClear(GLbitfield);
+#ifndef GL_NO_ERROR
+#define GL_NO_ERROR 0
+#endif
 #define GL_RENDERER 0x1F01
 #define GL_VERSION 0x1F02
 static inline const unsigned char *glGetString(GLenum n) { (void)n; return (const unsigned char *)"stub"; }

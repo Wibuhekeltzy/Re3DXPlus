@@ -9,6 +9,15 @@
 #include "gl.h"
 #include "mathx.h"
 #include "meterdb.h"
+/* the For Racing meter's REV lamp, lit (src/racing_lamp_data.h: tools/racing_lamp_data.py writes it
+ * from the game's own sprites; without it the lamp stays off, as it was) */
+#if defined(__has_include)
+#if __has_include("racing_lamp_data.h")
+#include <zlib.h>
+#include "racing_lamp_data.h"
+#define RACING_LAMP 1
+#endif
+#endif
 #include "sound.h"
 #include "storydemo.h"
 #include "storycut.h"
@@ -389,6 +398,60 @@ static int meter_style; /* the card's meter (hud_set_meter): 0 Normal, 1 For Rac
 
 void hud_set_meter(int style) { meter_style = style >= 0 && style < METER_STYLES ? style : 0; }
 
+/* The For Racing meter's REV lamp (clMeterConsole's racing_rev_off_m / _n, a part at 491, 283 of
+ * the dials): the dial's own sprite is the lamp off, found by its pixels among the meter's parts
+ * (hud_set_car), and racing_rev_on_m / _n replace it while the arcade's probes hold: the rev rate
+ * over .86 (CSeq::GetRevLamp) and CSeq::nCnt % 5 over 1 (lit 3 frames of 5). Where the art is not
+ * in the build, or the part's pixels are not the lamp's, the lamp stays as it was: off. */
+#define RACING_LAMP_REV_THRESHOLD 0.86f
+static hud_sprite racing_lamp_on;
+static int racing_lamp_slot = -1; /* the meter part that is the lamp, -1 none */
+static unsigned char racing_lamp_warm; /* its first draw is made on the race title page (hud_warm) */
+
+static int racing_lamp_lit(float rev_rate, int frame) { return rev_rate > RACING_LAMP_REV_THRESHOLD && frame % 5 > 1; }
+
+static void racing_lamp_clear(void) {
+  if (racing_lamp_on.tex) glDeleteTextures(1, &racing_lamp_on.tex);
+  memset(&racing_lamp_on, 0, sizeof racing_lamp_on);
+  racing_lamp_slot = -1;
+  racing_lamp_warm = 0;
+}
+
+#ifdef RACING_LAMP
+static int lamp_inflate(unsigned char *out, const unsigned char *src, size_t n) {
+  uLongf size = 64 * 64 * 4;
+  return uncompress(out, &size, src, (uLong)n) == Z_OK && size == 64 * 64 * 4;
+}
+
+/* Part `slot` of zone `zone` (2 morning, 3 night: For Racing), loaded as `off` w x h, is the lamp
+ * if its pixels are the arcade's lamp off, to the byte: then the lamp on is uploaded for it. Any
+ * failure leaves the lamp off (and the part drawn as it is). */
+static void lamp_prepare(const unsigned char *off, unsigned w, unsigned h, int zone, int slot) {
+  unsigned char expected[64 * 64 * 4], on[64 * 64 * 4];
+  const unsigned char *o = zone == 3 ? lamp_off_n : lamp_off_m;
+  const unsigned char *a = zone == 3 ? lamp_on_n : lamp_on_m;
+  size_t os = zone == 3 ? sizeof lamp_off_n : sizeof lamp_off_m;
+  size_t as = zone == 3 ? sizeof lamp_on_n : sizeof lamp_on_m;
+  if (racing_lamp_slot >= 0) return; /* the one lamp is found already (no second texture to lose) */
+  if (w != 64 || h != 64 || slot < 0 || slot >= METERDB_MAX_PARTS || !METER[slot].tex ||
+      !lamp_inflate(expected, o, os) || memcmp(expected, off, sizeof expected) || !lamp_inflate(on, a, as))
+    return;
+  /* an upload that fails must not touch what is loaded: its errors are told apart from older ones */
+  for (int j = 0; j < 16 && glGetError() != GL_NO_ERROR; ++j) {}
+  GLuint tex = upload(on, 64, 64);
+  if (!tex || glGetError() != GL_NO_ERROR) {
+    if (tex) glDeleteTextures(1, &tex);
+    return;
+  }
+  racing_lamp_on = (hud_sprite){ tex, 64, 64 };
+  racing_lamp_slot = slot;
+}
+#else
+static void lamp_prepare(const unsigned char *off, unsigned w, unsigned h, int zone, int slot) {
+  (void)off, (void)w, (void)h, (void)zone, (void)slot;
+}
+#endif
+
 static void meters_index(const char *data_dir) {
   snprintf(meter_path, sizeof meter_path, "%s/meters.bin", data_dir);
   FILE *f = fopen(meter_path, "rb");
@@ -409,6 +472,7 @@ void hud_set_car(int pack, int night) {
   int zone = 2 * meter_style + (night != 0);
   if (meter_car && pack >= 0 && pack < METER_CARS && meter_car == &METERDB[pack] && meter_night == zone) return;
   memset(meter_warm, 0, sizeof meter_warm);
+  racing_lamp_clear();
   for (int i = 0; i < METERDB_MAX_PARTS; ++i)
     if (METER[i].tex) glDeleteTextures(1, &METER[i].tex);
   memset(METER, 0, sizeof METER);
@@ -426,6 +490,10 @@ void hud_set_car(int pack, int night) {
       METER[i].tex = upload(px, w, h);
       METER[i].w = (float)w;
       METER[i].h = (float)h;
+      if (meter_night == 2 || meter_night == 3) { /* For Racing: its lamp is the fixed part at 491, 283 */
+        const meterdb_part *p = &meter_car->parts[meter_night][i];
+        if (p->x == 491 && p->y == 283 && p->input == METER_FIXED && !p->add) lamp_prepare(px, w, h, meter_night, i);
+      }
     }
     free(px);
   }
@@ -511,7 +579,9 @@ static void draw_meters(const car_state *car) {
     const meterdb_part *p = &meter_car->parts[night][i];
     float deg = p->a0 + p->a1 * meter_input(p, car);
     if (p->add) glBlendFunc(GL_SRC_ALPHA, GL_ONE); /* the R35's glowing night needles */
-    draw_k(&METER[i], CLUSTER_X + (p->x - 560) * HUD_K, CLUSTER_Y + (p->y - 228) * HUD_K, deg, HUD_K);
+    const hud_sprite *sp = &METER[i];
+    if (i == racing_lamp_slot && racing_lamp_on.tex && racing_lamp_lit(car->rev_rate, car->rev_lamp_frame)) sp = &racing_lamp_on;
+    draw_k(sp, CLUSTER_X + (p->x - 560) * HUD_K, CLUSTER_Y + (p->y - 228) * HUD_K, deg, HUD_K);
     if (p->add) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   }
   glDisableVertexAttribArray(1);
@@ -977,6 +1047,7 @@ int hud_warm(float screen_w, float screen_h, int n) {
   glDisableVertexAttribArray(2);
   int left = 0;
   for (int i = 0; i < METERDB_MAX_PARTS; ++i) left += warm_one(METER[i].tex, &meter_warm[i], &n);
+  left += warm_one(racing_lamp_on.tex, &racing_lamp_warm, &n); /* the REV lamp lit: 0 where there is none */
   for (int i = 0; i < SPR_COUNT; ++i) left += warm_one(SPR[i].tex, &spr_warm[i], &n);
   for (int i = 0; i < 2; ++i) left += warm_one(NAVI.tex[i], &navi_warm[i], &n);
   glDisableVertexAttribArray(1);

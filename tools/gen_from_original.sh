@@ -28,6 +28,10 @@ echo "the car select, lamps and meters..."
 run python3 tools/cardb.py "$MAIN" "$D/car"            # tools/cars.json, src/cardb.h
 run python3 tools/brakelampdb.py "$MAIN"               # tools/brakelamps.json
 run python3 tools/meterdb.py "$MAIN"                   # tools/meters.json, src/meterdb.h
+# (the For Racing meter's REV lamp: src/racing_lamp_data.h, the lamp's four sprites embedded; a
+# best effort, without it the lamp stays off)
+echo "  python3 tools/racing_lamp_data.py $D/sprite"
+python3 tools/racing_lamp_data.py "$D/sprite" || echo "  (no REV lamp art: the lamp stays off)"
 run python3 tools/neondb.py "$MAIN"                    # src/neondb.h
 run python3 tools/stage/pack_cars.py "$ORIG" --wheel-table   # src/carwheel.h
 echo "dress-up, names, sounds, sparks, titles..."
